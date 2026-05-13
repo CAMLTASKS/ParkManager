@@ -22,6 +22,12 @@
             'admin' => true,
         ],
         [
+            'label' => 'Mensualidades',
+            'route' => 'monthly.index',
+            'icon' => '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 2h10v2h3v18H4V4h3V2Zm2 2h6V3H9v1Zm-3 4v12h12V8H6Zm2 3h8v2H8v-2Zm0 4h5v2H8v-2Z"/></svg>',
+            'admin' => true,
+        ],
+        [
             'label' => 'Configuracion',
             'route' => 'settings',
             'icon' => '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m19.14 12.94.04-.94-.04-.94 2.03-1.58-1.92-3.32-2.39.96a7.04 7.04 0 0 0-1.63-.94L14.96 2h-3.92l-.27 2.18c-.58.22-1.12.52-1.63.94l-2.39-.96-1.92 3.32 2.03 1.58-.04.94.04.94-2.03 1.58 1.92 3.32 2.39-.96c.5.41 1.05.72 1.63.94L11.04 22h3.92l.27-2.18c.58-.22 1.12-.52 1.63-.94l2.39.96 1.92-3.32-2.03-1.58ZM13 15h-2v-2h2v2Zm0-4h-2V6h2v5Z"/></svg>',

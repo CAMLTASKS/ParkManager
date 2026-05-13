@@ -30,6 +30,16 @@
             <a href="{{ route('transaction.show', $activeTicket) }}" class="button button-primary">Abrir ticket activo</a>
         </div>
         @endif
+
+        @if ($monthlyNotice)
+        <div class="entry-alert monthly-entry-alert {{ $monthlyNotice['type'] }}">
+            <strong>{{ $monthlyNotice['title'] }}</strong>
+            <span>{{ $monthlyNotice['message'] }}</span>
+            @if ($currentUser->isAdmin())
+                <a href="{{ route('monthly.index', ['membership' => $monthlyLookup->id]) }}" class="button button-outline">Ver mensualidad</a>
+            @endif
+        </div>
+        @endif
     </article>
 
     <article class="card stack-md entry-form-card">

@@ -23,23 +23,30 @@ document.querySelectorAll('[data-modal-close]').forEach((button) => {
     });
 });
 
-document.querySelectorAll('[data-open-modal]').forEach((button) => {
-    button.addEventListener('click', () => {
-        const targetId = button.getAttribute('data-open-modal');
+document.addEventListener('click', (event) => {
+    if (!(event.target instanceof Element)) {
+        return;
+    }
+
+    const openButton = event.target.closest('[data-open-modal]');
+    if (openButton) {
+        const targetId = openButton.getAttribute('data-open-modal');
         const modal = document.querySelector(`[data-app-modal-id="${targetId}"]`);
         if (modal) {
+            event.preventDefault();
             modal.classList.add('is-visible');
         }
-    });
-});
+        return;
+    }
 
-document.querySelectorAll('[data-close-app-modal]').forEach((button) => {
-    button.addEventListener('click', () => {
-        const modal = button.closest('[data-app-modal-id]');
+    const closeButton = event.target.closest('[data-close-app-modal]');
+    if (closeButton) {
+        const modal = closeButton.closest('[data-app-modal-id]');
         if (modal) {
+            event.preventDefault();
             modal.classList.remove('is-visible');
         }
-    });
+    }
 });
 
 document.querySelectorAll('[data-loading-form]').forEach((form) => {
@@ -149,6 +156,162 @@ document.querySelectorAll('[data-entry-prefill-route]').forEach((input) => {
         window.location.href = `${route}?plate_lookup=${encodeURIComponent(value)}`;
     });
 });
+
+const monthlyPage = document.querySelector('[data-monthly-page]');
+
+if (monthlyPage) {
+    const monthlyUrl = monthlyPage.getAttribute('data-monthly-url');
+    const monthlyBoard = document.getElementById('monthlyBoard');
+    const monthlyModalSlot = document.getElementById('monthlyModalSlot');
+    const monthlySearchForm = monthlyPage.querySelector('[data-monthly-search-form]');
+    const monthlySearchInput = monthlySearchForm?.querySelector('input[name="search"]');
+    const monthlyStatusInput = monthlySearchForm?.querySelector('input[name="status"]');
+    const isMonthlyElement = (element) => monthlyPage.contains(element)
+        || monthlyBoard?.contains(element)
+        || monthlyModalSlot?.contains(element);
+
+    const setMonthlyLoading = (isLoading) => {
+        monthlyPage.classList.toggle('is-loading', isLoading);
+        if (monthlySearchForm) {
+            monthlySearchForm.querySelectorAll('button, input, select').forEach((control) => {
+                control.disabled = isLoading;
+            });
+        }
+    };
+
+    const monthlyParamsFromUrl = (url) => {
+        const targetUrl = new URL(url, window.location.origin);
+        return new URLSearchParams(targetUrl.search);
+    };
+
+    const syncMonthlyForm = (params) => {
+        if (monthlyStatusInput) {
+            monthlyStatusInput.value = params.get('status') || 'all';
+        }
+        if (monthlySearchInput) {
+            monthlySearchInput.value = params.get('search') || '';
+        }
+    };
+
+    const loadMonthly = (params, options = {}) => {
+        if (!monthlyUrl || !monthlyBoard || !monthlyModalSlot) {
+            return Promise.resolve();
+        }
+
+        const cleanParams = new URLSearchParams(params);
+        ['search', 'status', 'membership', 'activity_month', 'memberships_page'].forEach((key) => {
+            if ((cleanParams.get(key) || '') === '') {
+                cleanParams.delete(key);
+            }
+        });
+
+        const requestUrl = `${monthlyUrl}?${cleanParams.toString()}`;
+        setMonthlyLoading(true);
+
+        return fetch(requestUrl, {
+            headers: {
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+            },
+            credentials: 'same-origin',
+        })
+            .then((response) => {
+                if (!response.ok) {
+                    throw new Error('monthly-request-failed');
+                }
+                return response.json();
+            })
+            .then((payload) => {
+                if (!payload.ok) {
+                    throw new Error('monthly-response-invalid');
+                }
+
+                monthlyBoard.innerHTML = payload.board || '';
+                monthlyModalSlot.innerHTML = payload.detail || '';
+                syncMonthlyForm(cleanParams);
+
+                if (options.updateHistory !== false) {
+                    const pageUrl = `${window.location.pathname}${cleanParams.toString() ? `?${cleanParams.toString()}` : ''}`;
+                    window.history.pushState({ monthly: true }, '', pageUrl);
+                }
+
+                if (options.openDetail || payload.selected_id) {
+                    document.querySelector('[data-app-modal-id="monthlyDetailModal"]')?.classList.add('is-visible');
+                }
+                if (options.openActivity) {
+                    document.querySelector('[data-app-modal-id="monthlyActivityModal"]')?.classList.add('is-visible');
+                }
+            })
+            .catch(() => {
+                window.location.href = `${window.location.pathname}?${cleanParams.toString()}`;
+            })
+            .finally(() => setMonthlyLoading(false));
+    };
+
+    monthlySearchForm?.addEventListener('submit', (event) => {
+        event.preventDefault();
+        const formData = new FormData(monthlySearchForm);
+        const params = new URLSearchParams(formData);
+        params.delete('memberships_page');
+        loadMonthly(params, { openDetail: true });
+    });
+
+    document.addEventListener('click', (event) => {
+        if (!(event.target instanceof Element)) {
+            return;
+        }
+
+        const filterLink = event.target.closest('[data-monthly-filter]');
+        if (filterLink && isMonthlyElement(filterLink)) {
+            event.preventDefault();
+            const params = monthlyParamsFromUrl(filterLink.getAttribute('href') || window.location.href);
+            params.set('status', filterLink.getAttribute('data-status') || params.get('status') || 'all');
+            params.set('search', monthlySearchInput?.value || params.get('search') || '');
+            params.delete('membership');
+            params.delete('memberships_page');
+            loadMonthly(params);
+            return;
+        }
+
+        const detailLink = event.target.closest('[data-monthly-detail]');
+        if (detailLink && isMonthlyElement(detailLink)) {
+            event.preventDefault();
+            const params = monthlyParamsFromUrl(detailLink.getAttribute('href') || window.location.href);
+            params.set('membership', detailLink.getAttribute('data-membership') || params.get('membership') || '');
+            params.set('status', monthlyStatusInput?.value || params.get('status') || 'all');
+            params.set('search', monthlySearchInput?.value || params.get('search') || '');
+            loadMonthly(params, { openDetail: true });
+            return;
+        }
+
+        const pageLink = event.target.closest('#monthlyBoard .app-pagination a');
+        if (pageLink) {
+            event.preventDefault();
+            loadMonthly(monthlyParamsFromUrl(pageLink.getAttribute('href') || window.location.href));
+        }
+    });
+
+    document.addEventListener('submit', (event) => {
+        if (!(event.target instanceof Element)) {
+            return;
+        }
+
+        const activityForm = event.target.closest('[data-monthly-activity-form]');
+        if (!activityForm) {
+            return;
+        }
+
+        event.preventDefault();
+        loadMonthly(new URLSearchParams(new FormData(activityForm)), {
+            openDetail: true,
+            openActivity: true,
+        });
+    });
+
+    window.addEventListener('popstate', () => {
+        loadMonthly(new URLSearchParams(window.location.search), { updateHistory: false });
+    });
+}
 
 document.querySelectorAll('[data-locker-toggle]').forEach((toggle) => {
     const form = toggle.closest('form');
