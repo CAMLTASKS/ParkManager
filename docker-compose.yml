@@ -1,0 +1,63 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: parqueadero-app:latest
+    container_name: parqueadero_app
+    restart: unless-stopped
+    ports:
+      - "8095:80"
+    environment:
+      APP_NAME: EasyPark
+      APP_ENV: production
+      APP_KEY: base64:Q5DeUPEjO4aja0J7xkpGpk9Qsy+9kEz5thaKr9iCp74=
+      APP_DEBUG: "false"
+      APP_URL: http://localhost:8095
+      LOG_CHANNEL: stack
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_DATABASE: parkmanager
+      DB_USERNAME: parkmanager
+      DB_PASSWORD: "123Parqueadero."
+      CACHE_DRIVER: file
+      SESSION_DRIVER: file
+      QUEUE_CONNECTION: sync
+      PORTAL_SYNC_URL: https://ingedev94.com/portalricardo/sync.php
+      PORTAL_SYNC_TOKEN: cambia-este-token
+      PORTAL_SYNC_INTERVAL_MINUTES: 5
+      DOCKER_SEED_ON_START: "true"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - parqueadero_storage:/var/www/html/storage
+
+  mysql:
+    image: mysql:8.0
+    container_name: parqueadero_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: parkmanager
+      MYSQL_USER: parkmanager
+      MYSQL_PASSWORD: "123Parqueadero."
+      MYSQL_ROOT_PASSWORD: "123Parqueadero.Root"
+      TZ: America/Bogota
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - parqueadero_mysql:/var/lib/mysql
+    ports:
+      - "3309:3306"
+
+volumes:
+  parqueadero_mysql:
+  parqueadero_storage:

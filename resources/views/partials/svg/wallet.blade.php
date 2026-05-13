@@ -1,0 +1,1 @@
+<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7H4a2 2 0 0 0-2 2v8a3 3 0 0 0 3 3h15a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2Zm0 11H5a1 1 0 0 1-1-1V9h16v9ZM16 5H5a1 1 0 0 0 0 2h11V5Zm1 8a2 2 0 1 0 .001 3.999A2 2 0 0 0 17 13Z"/></svg>
