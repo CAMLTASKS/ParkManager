@@ -27,13 +27,14 @@
                 <option value="normal" @selected(old('type', $tariff?->tariff_type) === 'normal')>Minuto</option>
                 <option value="plena" @selected(old('type', $tariff?->tariff_type) === 'plena')>Tarifa plena</option>
                 <option value="convenio" @selected(old('type', $tariff?->tariff_type) === 'convenio')>Convenio</option>
+                <option value="mensualidad" @selected(old('type', $tariff?->tariff_type) === 'mensualidad')>Mensualidad</option>
             </select>
         </label>
 
         <input type="hidden" name="charge_unit" value="minute">
         <input type="hidden" name="charge_interval" value="1">
 
-        <label class="field" data-tariff-field="normal convenio">
+        <label class="field" data-tariff-field="normal convenio mensualidad">
             <span data-rate-label>Valor por minuto</span>
             <input type="number" min="0" name="unit_rate"
                    value="{{ old('unit_rate', $tariff?->unit_rate ?? 0) }}">
@@ -117,7 +118,9 @@
 
             const rateLabel = form.querySelector('[data-rate-label]');
             if (rateLabel) {
-                rateLabel.textContent = type === 'convenio' ? 'Valor del convenio' : 'Valor por minuto';
+                rateLabel.textContent = type === 'mensualidad'
+                    ? 'Valor mensual'
+                    : (type === 'convenio' ? 'Valor del convenio' : 'Valor por minuto');
             }
         };
 

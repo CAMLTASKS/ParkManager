@@ -56,7 +56,7 @@
             <span>Entrada</span>
         </a>
         @if ($currentUser->isAdmin())
-            <a href="{{ route('settings') }}" class="{{ request()->routeIs('settings') || request()->routeIs('audit') || request()->routeIs('reports') ? 'active' : '' }}">
+            <a href="{{ route('settings') }}" class="{{ request()->routeIs('settings') || request()->routeIs('audit') || request()->routeIs('reports') || request()->routeIs('monthly.*') ? 'active' : '' }}">
                 <span class="mobile-nav-icon">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 1 3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4Zm1 6v5h4v2h-6V7h2Z"/></svg>
                 </span>

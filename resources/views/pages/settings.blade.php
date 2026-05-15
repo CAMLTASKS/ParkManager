@@ -61,6 +61,8 @@
                             Despues de {{ $tariff->threshold_minutes }} min
                         @elseif($tariff->tariff_type === 'convenio')
                             Cada {{ $tariff->max_minutes }} min
+                        @elseif($tariff->tariff_type === 'mensualidad')
+                            Mensual
                         @else
                             Por minuto
                         @endif
@@ -86,6 +88,10 @@
 
                         @if($tariff->tariff_type === 'convenio')
                         <small>{{ $tariff->max_minutes }} min por convenio</small>
+                        @endif
+
+                        @if($tariff->tariff_type === 'mensualidad')
+                        <small>No aparece en entrada</small>
                         @endif
                     </td>
 
@@ -159,7 +165,7 @@
         <button class="modal-close" type="button" data-close-app-modal>&times;</button>
         <span class="modal-kicker">TARIFAS</span>
         <h3>Agregar tarifa</h3>
-        <p>Configura cobro por minuto, plena con umbral o convenio por tiempo.</p>
+        <p>Configura cobro por minuto, plena con umbral, convenio o mensualidad.</p>
         @include('pages.partials.tariff-form', [
         'action' => route('settings.tariff.store'),
         'method' => 'POST',
@@ -180,6 +186,7 @@
         'normal' => 'Cobra un valor por cada minuto',
         'plena' => 'Tarifa que se activa después de un umbral',
         'convenio' => 'Cobra un valor fijo por cada bloque de tiempo',
+        'mensualidad' => 'Valor fijo mensual para clientes registrados',
         default => ''
     } }}
         </p>

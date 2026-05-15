@@ -48,6 +48,16 @@
             <span class="transaction-alert-pill">@include('partials.svg.chart') {{ $ticket->tariffProfile?->name ?? 'Sin tarifa' }}</span>
         </div>
 
+        @if ($monthlyNotice)
+            <div class="entry-alert monthly-entry-alert {{ $monthlyNotice['type'] }}">
+                <strong>{{ $monthlyNotice['title'] }}</strong>
+                <span>{{ $monthlyNotice['message'] }}</span>
+                @if ($currentUser->isAdmin())
+                    <a href="{{ route('monthly.index', ['membership' => $monthlyMembership->id]) }}" class="button button-outline">Ver mensualidad</a>
+                @endif
+            </div>
+        @endif
+
         <div class="transaction-data-grid">
             <div class="info-list compact">
                 <div><span>Ingreso</span><strong>{{ optional($ticket->entry_time)->format('d/m/Y h:i A') }}</strong></div>
@@ -84,30 +94,46 @@
                 @csrf
                 <input type="hidden" name="ticket_id" value="{{ $ticket->id }}">
 
-                <div class="payment-choice-grid payment-choice-grid-enhanced">
-                    <label class="choice-tile payment-tile active">
-                        <input type="radio" name="payment_method" value="efectivo" checked>
-                        <span class="payment-icon">@include('partials.svg.wallet')</span>
-                        <strong>Efectivo</strong>
-                        <small>Cobro en caja</small>
-                    </label>
-                    <label class="choice-tile payment-tile">
-                        <input type="radio" name="payment_method" value="nequi">
-                        <span class="payment-icon payment-icon-nequi">@include('partials.svg.cashier')</span>
-                        <strong>Nequi</strong>
-                        <small>Transferencia</small>
-                    </label>
-                    <label class="choice-tile payment-tile">
-                        <input type="radio" name="payment_method" value="pending">
-                        <span class="payment-icon payment-icon-pending">@include('partials.svg.clock')</span>
-                        <strong>Pendiente</strong>
-                        <small>Cobrar despues</small>
-                    </label>
-                </div>
+                @if ($monthlyMembership?->isActiveCurrent())
+                    <input type="hidden" name="payment_method" value="mensualidad">
+                    <div class="entry-alert monthly-entry-alert success">
+                        <strong>Salida por mensualidad</strong>
+                        <span>Esta placa esta al dia. La salida se cerrara sin cobro y quedara registrada en mensualidades.</span>
+                    </div>
+                @else
+                    <div class="payment-choice-grid payment-choice-grid-enhanced">
+                        <label class="choice-tile payment-tile active">
+                            <input type="radio" name="payment_method" value="efectivo" checked>
+                            <span class="payment-icon">@include('partials.svg.wallet')</span>
+                            <strong>Efectivo</strong>
+                            <small>Cobro en caja</small>
+                        </label>
+                        <label class="choice-tile payment-tile">
+                            <input type="radio" name="payment_method" value="nequi">
+                            <span class="payment-icon payment-icon-nequi">@include('partials.svg.cashier')</span>
+                            <strong>Nequi</strong>
+                            <small>Transferencia</small>
+                        </label>
+                        <label class="choice-tile payment-tile">
+                            <input type="radio" name="payment_method" value="pending">
+                            <span class="payment-icon payment-icon-pending">@include('partials.svg.clock')</span>
+                            <strong>Pendiente</strong>
+                            <small>Cobrar despues</small>
+                        </label>
+                    </div>
+                @endif
+
+                <label class="field">
+                    <span>Valor a pagar</span>
+                    <input type="number" min="0" name="payment_total" value="{{ $paymentTotal }}" @disabled(! $canEditPaymentTotal || $monthlyMembership?->isActiveCurrent()) @readonly(! $canEditPaymentTotal || $monthlyMembership?->isActiveCurrent())>
+                    @unless ($canEditPaymentTotal)
+                        <small>Solo admin puede modificar este valor.</small>
+                    @endunless
+                </label>
 
                 <label class="field">
                     <span>Valor recibido</span>
-                    <input type="number" min="0" name="received_amount" value="{{ $summary['total'] }}">
+                    <input type="number" min="0" name="received_amount" value="{{ $paymentTotal }}" @readonly($monthlyMembership?->isActiveCurrent())>
                 </label>
 
                 <label class="field transaction-check">
@@ -120,6 +146,9 @@
                     <textarea name="notes" rows="3" placeholder="Observacion del cierre, recaudo o novedad."></textarea>
                 </label>
 
+                <button class="button button-outline button-block transaction-submit" type="submit" name="print_mode" value="0">
+                    Guardar sin imprimir
+                </button>
                 <button class="button button-primary button-block transaction-submit" type="submit">
                     {{ $ticket->status === 'pending_payment' ? 'Actualizar salida' : 'Confirmar salida' }}
                 </button>

@@ -50,6 +50,53 @@ CREATE TABLE IF NOT EXISTS portal_events (
     KEY portal_events_event_time_index (event_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS portal_monthly_memberships (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    source_membership_id VARCHAR(80) NOT NULL,
+    plate VARCHAR(30) NOT NULL,
+    customer_name VARCHAR(160) NOT NULL,
+    vehicle_type VARCHAR(40) NOT NULL,
+    vehicle_brand VARCHAR(100) NULL,
+    phone VARCHAR(40) NULL,
+    site_name VARCHAR(160) NULL,
+    tariff_name VARCHAR(160) NULL,
+    tariff_amount INT NOT NULL DEFAULT 0,
+    starts_at DATE NULL,
+    next_payment_date DATE NULL,
+    status VARCHAR(40) NOT NULL DEFAULT 'active',
+    days_overdue INT NOT NULL DEFAULT 0,
+    last_payment_code VARCHAR(80) NULL,
+    last_payment_amount INT NOT NULL DEFAULT 0,
+    last_paid_at DATETIME NULL,
+    last_activity_type VARCHAR(40) NULL,
+    last_activity_at DATETIME NULL,
+    notes TEXT NULL,
+    last_synced_at DATETIME NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE KEY portal_monthly_source_unique (source_membership_id),
+    KEY portal_monthly_plate_index (plate),
+    KEY portal_monthly_status_index (status),
+    KEY portal_monthly_next_payment_index (next_payment_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS portal_monthly_payments (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    source_payment_id VARCHAR(80) NOT NULL,
+    source_membership_id VARCHAR(80) NOT NULL,
+    receipt_code VARCHAR(80) NOT NULL,
+    method VARCHAR(40) NOT NULL,
+    amount INT NOT NULL DEFAULT 0,
+    period_start DATE NULL,
+    period_end DATE NULL,
+    paid_at DATETIME NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE KEY portal_monthly_payment_source_unique (source_payment_id),
+    KEY portal_monthly_payment_membership_index (source_membership_id),
+    KEY portal_monthly_payment_paid_at_index (paid_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS portal_users (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(120) NOT NULL,

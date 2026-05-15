@@ -3,6 +3,9 @@
 namespace App\Http\Controllers;
 
 use App\Models\AuditLog;
+use App\Models\MonthlyMembership;
+use App\Models\MonthlyMembershipActivity;
+use App\Models\MonthlyMembershipPayment;
 use App\Models\ParkingTicket;
 use App\Models\Payment;
 use App\Models\PortalSyncJob;
@@ -208,6 +211,7 @@ class ParkingController extends Controller
     public function entry(Request $request): View|RedirectResponse
     {
         $plateLookup = Str::upper(str_replace(' ', '', trim((string) $request->query('plate_lookup', ''))));
+        $monthlyLookup = $plateLookup !== '' ? $this->findMonthlyMembershipByPlate($plateLookup) : null;
         if ($plateLookup !== '') {
             $selectedTicket = $this->ticketLookupQuery($plateLookup)
                 ->whereIn('status', ['active', 'pending_payment'])
@@ -250,6 +254,8 @@ class ParkingController extends Controller
             'defaultVehicleType' => 'moto',
             'nextTicketCode' => $this->nextTicketCode(),
             'lockerFee' => (int) ((auth()->user()?->site ?: Site::query()->first())?->locker_fee ?? 0),
+            'monthlyLookup' => $monthlyLookup,
+            'monthlyNotice' => $monthlyLookup ? $this->monthlyMembershipNotice($monthlyLookup) : null,
         ]));
     }
 
@@ -306,6 +312,7 @@ class ParkingController extends Controller
             ->where('plate', $plate)
             ->whereIn('status', ['active', 'pending_payment'])
             ->first();
+        $monthlyMembership = $this->findMonthlyMembershipByPlate($plate);
 
         if ($activeTicket) {
             return redirect()->route('transaction.show', $activeTicket)
@@ -326,7 +333,7 @@ class ParkingController extends Controller
             'site_id' => $site?->id,
             'tariff_profile_id' => $data['tariff_profile_id'],
             'ticket_code' => $ticketCode,
-            'barcode' => $ticketCode,
+            'barcode' => $this->barcodeValueFromTicketCode($ticketCode),
             'plate' => $plate,
             'vehicle_type' => $data['vehicle_type'],
             'status' => 'active',
@@ -344,12 +351,37 @@ class ParkingController extends Controller
             'is_lost_ticket' => false,
         ]);
 
+        if ($monthlyMembership) {
+            $this->recordMonthlyActivity(
+                $monthlyMembership,
+                $ticket,
+                'entrada',
+                $monthlyMembership->isActiveCurrent()
+                    ? 'Entrada registrada con mensualidad activa.'
+                    : 'Entrada registrada con mensualidad pendiente o cancelada.'
+            );
+        }
+
         $this->logAction('entrada', 'ticket', 'Ticket ' . $ticket->ticket_code . ' creado para ' . $ticket->plate, $ticket, [
             'tarifa' => $ticket->tariffProfile?->name,
             'ubicacion' => $ticket->location_number,
             'locker' => $ticket->uses_locker ? $ticket->locker_number : 'no',
+            'mensualidad' => $monthlyMembership ? $monthlyMembership->currentStatus() : 'no',
         ]);
         $this->syncPortalTicket($ticket->fresh(['site', 'tariffProfile', 'payment']), 'entrada');
+
+        $entryModal = $monthlyMembership
+            ? $this->monthlyMembershipModal($monthlyMembership, 'Entrada registrada')
+            : [
+                'type' => 'success',
+                'title' => 'Entrada registrada',
+                'message' => 'Ticket ' . $ticket->ticket_code . ' creado correctamente.',
+            ];
+
+        if ($monthlyMembership) {
+            return redirect()->route('entry')
+                ->with('modal', $entryModal);
+        }
 
         if ($request->boolean('send_whatsapp')) {
             return redirect()->away($this->whatsappReceiptUrl($ticket->fresh(['site', 'tariffProfile', 'payment']), 'ingreso'));
@@ -357,29 +389,22 @@ class ParkingController extends Controller
 
         if (($request->input('print_mode', '1')) === '0') {
             return redirect()->route('entry')
-                ->with('modal', [
-                    'type' => 'success',
-                    'title' => 'Entrada registrada',
-                    'message' => 'Ticket ' . $ticket->ticket_code . ' creado correctamente.',
-                ]);
+                ->with('modal', $entryModal);
         }
 
         return redirect()->route('tickets.print', [
             'ticket' => $ticket,
             'type' => 'ingreso',
         ])
-            ->with('modal', [
-                'type' => 'success',
-                'title' => 'Entrada registrada',
-                'message' => 'Ticket ' . $ticket->ticket_code . ' creado correctamente.',
-            ]);
+            ->with('modal', $entryModal);
     }
 
     public function closeTicket(Request $request): RedirectResponse
     {
         $data = $request->validate([
             'ticket_id' => ['required', 'exists:parking_tickets,id'],
-            'payment_method' => ['required', 'in:efectivo,nequi,pending'],
+            'payment_method' => ['required', 'in:efectivo,nequi,pending,mensualidad'],
+            'payment_total' => ['nullable', 'numeric', 'min:0'],
             'received_amount' => ['nullable', 'numeric', 'min:0'],
             'notes' => ['nullable', 'string', 'max:500'],
             'mark_lost_ticket' => ['nullable', 'boolean'],
@@ -387,6 +412,8 @@ class ParkingController extends Controller
 
         /** @var ParkingTicket $ticket */
         $ticket = $this->scopedTickets()->with(['tariffProfile', 'payment'])->findOrFail($data['ticket_id']);
+        $monthlyMembership = $this->findMonthlyMembershipByPlate($ticket->plate);
+        $isActiveMonthlyTicket = $monthlyMembership?->isActiveCurrent() ?? false;
 
         if (! in_array($ticket->status, ['active', 'pending_payment'], true)) {
             return redirect()->route('transaction.show', $ticket)
@@ -402,7 +429,20 @@ class ParkingController extends Controller
         $ticket->closed_by = auth()->id();
 
         $summary = $this->calculateTicket($ticket);
-        $method = $data['payment_method'];
+        if ($isActiveMonthlyTicket) {
+            $summary['subtotal'] = 0;
+            $summary['parking_subtotal'] = 0;
+            $summary['locker_fee'] = 0;
+            $summary['surcharge'] = 0;
+            $summary['tax'] = 0;
+            $summary['total'] = 0;
+            $summary['pricing_label'] = 'Mensualidad activa';
+            $summary['applied_tariff'] = $monthlyMembership->tariffProfile?->name ?? 'Mensualidad';
+        }
+        if (! $isActiveMonthlyTicket && auth()->user()?->isAdmin() && array_key_exists('payment_total', $data) && $data['payment_total'] !== null) {
+            $summary['total'] = (int) round((float) $data['payment_total']);
+        }
+        $method = $isActiveMonthlyTicket ? 'mensualidad' : $data['payment_method'];
         $received = (int) round((float) ($data['received_amount'] ?? 0));
         $status = $method === 'pending' ? 'pending' : 'paid';
 
@@ -438,9 +478,28 @@ class ParkingController extends Controller
             );
         });
         $this->syncPortalTicket($ticket->fresh(['site', 'tariffProfile', 'payment']), $status === 'paid' ? 'salida' : 'pago_pendiente', $summary);
+        if ($monthlyMembership) {
+            $this->recordMonthlyActivity($monthlyMembership, $ticket->fresh(), 'salida', $isActiveMonthlyTicket ? 'Salida sin cobro por mensualidad activa.' : 'Salida con mensualidad no activa.');
+        }
+
+        if ($monthlyMembership) {
+            return redirect()->route('transaction.show', $ticket)
+                ->with('modal', $this->monthlyMembershipModal($monthlyMembership, 'Salida registrada'));
+        }
 
         if ($request->boolean('send_whatsapp')) {
             return redirect()->away($this->whatsappReceiptUrl($ticket->fresh(['site', 'tariffProfile', 'payment']), 'salida'));
+        }
+
+        if (($request->input('print_mode', '1')) === '0') {
+            return redirect()->route('transaction.show', $ticket)
+                ->with('modal', [
+                    'type' => $status === 'paid' ? 'success' : 'warning',
+                    'title' => $status === 'paid' ? 'Salida guardada' : 'Pago pendiente',
+                    'message' => $status === 'paid'
+                        ? 'Salida guardada para ' . $ticket->plate . ' sin imprimir.'
+                        : 'El ticket quedo pendiente por pagar y no se imprimio.',
+                ]);
         }
 
         return redirect()->route('tickets.print', [
@@ -671,6 +730,248 @@ class ParkingController extends Controller
             ]);
     }
 
+    public function monthlyMemberships(Request $request): View
+    {
+        $this->authorizeAdmin();
+
+        return view('pages.monthly-memberships', $this->monthlyMembershipViewData($request));
+    }
+
+    public function monthlyMembershipsData(Request $request): JsonResponse
+    {
+        $this->authorizeAdmin();
+
+        $data = $this->monthlyMembershipViewData($request);
+
+        return response()->json([
+            'ok' => true,
+            'board' => view('pages.partials.monthly-board', $data)->render(),
+            'detail' => view('pages.partials.monthly-detail-modal', $data)->render(),
+            'selected_id' => $data['selectedMembership']?->id,
+        ]);
+    }
+
+    private function monthlyMembershipViewData(Request $request): array
+    {
+        $status = (string) $request->query('status', 'all');
+        $search = Str::upper(trim((string) $request->query('search', '')));
+        $plateSearch = Str::upper(str_replace(' ', '', $search));
+        $today = today();
+        $exactMembership = $plateSearch !== ''
+            ? $this->scopedMonthlyMemberships()->where('plate', $plateSearch)->first()
+            : null;
+
+        $query = $this->scopedMonthlyMemberships()
+            ->with(['tariffProfile', 'payments' => fn($payments) => $payments->latest('paid_at'), 'activities' => fn($activities) => $activities->latest('occurred_at')->limit(3)])
+            ->when($search !== '', function (Builder $builder) use ($search): void {
+                $builder->where(function (Builder $inner) use ($search): void {
+                    $inner->where('plate', 'like', '%' . $search . '%')
+                        ->orWhere('customer_name', 'like', '%' . $search . '%')
+                        ->orWhere('phone', 'like', '%' . $search . '%');
+                });
+            })
+            ->when($status === 'active', fn(Builder $builder) => $builder->where('status', '!=', 'cancelled')->whereDate('next_payment_date', '>=', $today))
+            ->when($status === 'overdue', fn(Builder $builder) => $builder->where('status', '!=', 'cancelled')->whereDate('next_payment_date', '<', $today))
+            ->when($status === 'due', fn(Builder $builder) => $builder->where('status', '!=', 'cancelled')->whereBetween('next_payment_date', [$today, $today->copy()->addDays(5)]))
+            ->when($status === 'paid', fn(Builder $builder) => $builder->whereHas('payments'))
+            ->when($status === 'cancelled', fn(Builder $builder) => $builder->where('status', 'cancelled'));
+
+        $memberships = $query
+            ->orderByRaw("CASE WHEN status = 'cancelled' THEN 2 WHEN next_payment_date < ? THEN 0 ELSE 1 END", [$today->toDateString()])
+            ->orderBy('next_payment_date')
+            ->paginate(12, ['*'], 'memberships_page')
+            ->withQueryString();
+
+        $selected = $request->query('membership')
+            ? $this->scopedMonthlyMemberships()->with(['tariffProfile', 'payments.user', 'activities.ticket'])->find($request->query('membership'))
+            : ($exactMembership ? $this->scopedMonthlyMemberships()->with(['tariffProfile', 'payments.user', 'activities.ticket'])->find($exactMembership->id) : null);
+
+        $activityMonth = (string) $request->query('activity_month', now()->format('Y-m'));
+        if (! preg_match('/^\d{4}-\d{2}$/', $activityMonth)) {
+            $activityMonth = now()->format('Y-m');
+        }
+
+        return $this->sharedData([
+            'pageTitle' => 'Mensualidades',
+            'pageSubtitle' => 'Administracion, pagos, vencimientos y actividad de vehiculos mensuales.',
+            'memberships' => $memberships,
+            'selectedMembership' => $selected,
+            'monthlyTariffs' => TariffProfile::query()
+                ->where('active', true)
+                ->where('tariff_type', 'mensualidad')
+                ->orderBy('vehicle_type')
+                ->orderBy('name')
+                ->get(),
+            'filters' => [
+                'status' => $status,
+                'search' => $search,
+            ],
+            'monthlyStats' => $this->monthlyMembershipStats(),
+            'activityMonth' => $activityMonth,
+        ]);
+    }
+
+    public function storeMonthlyMembership(Request $request): RedirectResponse
+    {
+        $this->authorizeAdmin();
+
+        $data = $this->validateMonthlyMembership($request);
+        $site = auth()->user()?->site ?: Site::query()->firstOrFail();
+        $plate = Str::upper(str_replace(' ', '', $data['plate']));
+        if (! $this->isMonthlyTariff((int) $data['tariff_profile_id'])) {
+            return back()->withInput()->with('modal', [
+                'type' => 'warning',
+                'title' => 'Tarifa no valida',
+                'message' => 'Selecciona una tarifa de tipo mensualidad.',
+            ]);
+        }
+
+        $exists = MonthlyMembership::query()
+            ->where('site_id', $site->id)
+            ->where('plate', $plate)
+            ->exists();
+
+        if ($exists) {
+            return back()->withInput()->with('modal', [
+                'type' => 'warning',
+                'title' => 'Mensualidad existente',
+                'message' => 'Ya existe una mensualidad registrada para la placa ' . $plate . '.',
+            ]);
+        }
+
+        $membership = MonthlyMembership::create([
+            ...$data,
+            'site_id' => $site->id,
+            'plate' => $plate,
+            'customer_name' => Str::upper(trim($data['customer_name'])),
+            'vehicle_brand' => $data['vehicle_brand'] ? Str::upper(trim($data['vehicle_brand'])) : null,
+            'status' => 'active',
+        ]);
+
+        $this->logAction('mensualidad_creada', 'mensualidades', 'Mensualidad creada para ' . $membership->plate, $membership, $data);
+        $this->syncMonthlyMembership($membership->fresh(['site', 'tariffProfile', 'payments', 'activities']), 'mensualidad_creada');
+
+        return redirect()->route('monthly.index', ['membership' => $membership->id])
+            ->with('modal', [
+                'type' => 'success',
+                'title' => 'Mensualidad creada',
+                'message' => 'La mensualidad de ' . $membership->plate . ' quedo registrada.',
+            ]);
+    }
+
+    public function updateMonthlyMembership(Request $request, MonthlyMembership $membership): RedirectResponse
+    {
+        $this->authorizeAdmin();
+        abort_unless($this->canAccessMonthlyMembership($membership), 403);
+
+        $data = $this->validateMonthlyMembership($request, $membership);
+        if (! $this->isMonthlyTariff((int) $data['tariff_profile_id'])) {
+            return back()->withInput()->with('modal', [
+                'type' => 'warning',
+                'title' => 'Tarifa no valida',
+                'message' => 'Selecciona una tarifa de tipo mensualidad.',
+            ]);
+        }
+        $membership->update([
+            ...$data,
+            'plate' => Str::upper(str_replace(' ', '', $data['plate'])),
+            'customer_name' => Str::upper(trim($data['customer_name'])),
+            'vehicle_brand' => $data['vehicle_brand'] ? Str::upper(trim($data['vehicle_brand'])) : null,
+            'status' => $data['status'] ?? $membership->status,
+        ]);
+
+        $this->logAction('mensualidad_actualizada', 'mensualidades', 'Mensualidad actualizada para ' . $membership->plate, $membership, $data);
+        $this->syncMonthlyMembership($membership->fresh(['site', 'tariffProfile', 'payments', 'activities']), 'mensualidad_actualizada');
+
+        return redirect()->route('monthly.index', ['membership' => $membership->id])
+            ->with('modal', [
+                'type' => 'success',
+                'title' => 'Mensualidad guardada',
+                'message' => 'Los datos de la mensualidad fueron actualizados.',
+            ]);
+    }
+
+    public function cancelMonthlyMembership(MonthlyMembership $membership): RedirectResponse
+    {
+        $this->authorizeAdmin();
+        abort_unless($this->canAccessMonthlyMembership($membership), 403);
+
+        $membership->update(['status' => 'cancelled']);
+        $this->logAction('mensualidad_cancelada', 'mensualidades', 'Mensualidad cancelada para ' . $membership->plate, $membership);
+        $this->syncMonthlyMembership($membership->fresh(['site', 'tariffProfile', 'payments', 'activities']), 'mensualidad_cancelada');
+
+        return redirect()->route('monthly.index', ['membership' => $membership->id])
+            ->with('modal', [
+                'type' => 'warning',
+                'title' => 'Mensualidad cancelada',
+                'message' => 'La mensualidad quedo cancelada.',
+            ]);
+    }
+
+    public function payMonthlyMembership(Request $request, MonthlyMembership $membership): RedirectResponse
+    {
+        $this->authorizeAdmin();
+        abort_unless($this->canAccessMonthlyMembership($membership), 403);
+
+        $data = $request->validate([
+            'method' => ['required', 'in:efectivo,nequi'],
+            'amount' => ['required', 'integer', 'min:0'],
+            'period_start' => ['nullable', 'date'],
+            'notes' => ['nullable', 'string', 'max:500'],
+        ]);
+
+        $payment = DB::transaction(function () use ($membership, $data): MonthlyMembershipPayment {
+            $periodStart = ! empty($data['period_start'])
+                ? Carbon::parse($data['period_start'])->startOfDay()
+                : $membership->next_payment_date->copy();
+            $periodEnd = $periodStart->copy()->addMonthNoOverflow()->subDay();
+
+            $payment = MonthlyMembershipPayment::create([
+                'monthly_membership_id' => $membership->id,
+                'user_id' => auth()->id(),
+                'receipt_code' => $this->nextMonthlyReceiptCode(),
+                'method' => $data['method'],
+                'amount' => (int) $data['amount'],
+                'period_start' => $periodStart,
+                'period_end' => $periodEnd,
+                'paid_at' => now(),
+                'notes' => $data['notes'] ?? null,
+            ]);
+
+            $membership->update([
+                'next_payment_date' => $periodEnd->copy()->addDay(),
+                'status' => 'active',
+            ]);
+
+            return $payment;
+        });
+
+        $this->logAction('mensualidad_pagada', 'mensualidades', 'Pago de mensualidad ' . $payment->receipt_code . ' para ' . $membership->plate, $payment, $data);
+        $this->syncMonthlyMembership($membership->fresh(['site', 'tariffProfile', 'payments', 'activities']), 'mensualidad_pagada', $payment->fresh(['membership', 'user']));
+
+        return redirect()->route('monthly.receipt', $payment);
+    }
+
+    public function monthlyPaymentReceipt(MonthlyMembershipPayment $payment): View
+    {
+        $payment->load(['membership.site', 'membership.tariffProfile', 'user']);
+        abort_unless($this->canAccessMonthlyMembership($payment->membership), 403);
+
+        return view('pages.monthly-receipt', $this->sharedData([
+            'pageTitle' => 'Recibo de mensualidad',
+            'pageSubtitle' => 'Comprobante de pago mensual.',
+            'payment' => $payment,
+            'membership' => $payment->membership,
+            'receiptBusiness' => [
+                'name' => 'PARQUEADERO DONDE RICHARD',
+                'regime' => 'Regimen simplificado',
+                'nit' => 'NIT 7662483-1',
+                'address' => config('app.parking_address', env('PARKING_ADDRESS', 'Cra 71a #8 - 43 sur')),
+                'phone' => config('app.parking_phone', env('PARKING_PHONE', '3237902525')),
+            ],
+        ]));
+    }
+
     public function storeTariff(Request $request): RedirectResponse
     {
         $this->authorizeAdmin();
@@ -831,12 +1132,28 @@ class ParkingController extends Controller
     {
         abort_unless($this->canAccessTicket($ticket), 403);
         $ticket->load(['site', 'payment', 'tariffProfile', 'creator', 'closer', 'audits.user', 'portalSyncJob']);
+        $summary = $this->displaySummary($ticket);
+        $monthlyMembership = $this->findMonthlyMembershipByPlate($ticket->plate);
+        if ($monthlyMembership?->isActiveCurrent() && ! $ticket->payment) {
+            $summary['subtotal'] = 0;
+            $summary['parking_subtotal'] = 0;
+            $summary['locker_fee'] = 0;
+            $summary['surcharge'] = 0;
+            $summary['tax'] = 0;
+            $summary['total'] = 0;
+            $summary['pricing_label'] = 'Mensualidad activa';
+            $summary['applied_tariff'] = $monthlyMembership->tariffProfile?->name ?? 'Mensualidad';
+        }
 
         return view('pages.transaction', $this->sharedData([
             'pageTitle' => 'Detalle de transaccion',
             'pageSubtitle' => 'Ticket ' . $ticket->ticket_code . ' - ' . $ticket->plate,
             'ticket' => $ticket,
-            'summary' => $this->calculateTicket($ticket),
+            'summary' => $summary,
+            'canEditPaymentTotal' => auth()->user()?->isAdmin() ?? false,
+            'paymentTotal' => $summary['total'],
+            'monthlyMembership' => $monthlyMembership,
+            'monthlyNotice' => $monthlyMembership ? $this->monthlyMembershipNotice($monthlyMembership) : null,
             'whatsappReceiptUrls' => [
                 'ingreso' => $this->whatsappReceiptUrl($ticket, 'ingreso'),
                 'salida' => $this->whatsappReceiptUrl($ticket, 'salida'),
@@ -891,7 +1208,7 @@ class ParkingController extends Controller
     private function receiptViewData(ParkingTicket $ticket, string $type, array $extra = []): array
     {
         $ticket->load(['site', 'payment', 'tariffProfile', 'creator', 'closer']);
-        $summary = $this->calculateTicket($ticket);
+        $summary = $this->displaySummary($ticket);
         $site = $ticket->site ?: auth()->user()?->site ?: Site::query()->first();
 
         return $this->sharedData(array_merge([
@@ -902,11 +1219,14 @@ class ParkingController extends Controller
             'summary' => $summary,
             'site' => $site,
             'receiptBusiness' => [
-                'name' => Str::upper('Parqueadero Donde Richard'),
-                'phone' => config('app.parking_phone', env('PARKING_PHONE', '3151')),
-                'address' => config('app.parking_address', env('PARKING_ADDRESS', 'Calle 57 dsaj')),
+                'name' => 'PARQUEADERO DONDE RICHARD',
+                'regime' => 'Regimen simplificado',
+                'nit' => 'NIT 7662483-1',
+                'address' => config('app.parking_address', env('PARKING_ADDRESS', 'Cra 71a #8 - 43 sur')),
+                'phone' => config('app.parking_phone', env('PARKING_PHONE', '3237902525')),
             ],
-            'barcodeSvg' => $type === 'ingreso' ? $this->code39BarcodeSvg($ticket->ticket_code) : null,
+            'barcodeValue' => $this->receiptBarcodeValue($ticket),
+            'barcodeSvg' => $type === 'ingreso' ? $this->code39BarcodeSvg($this->receiptBarcodeValue($ticket)) : null,
             'formattedDuration' => $this->formatReceiptDuration((int) $summary['minutes']),
             'formattedLocation' => $this->formatReceiptLocation($ticket),
             'whatsappReceiptUrl' => $this->whatsappReceiptUrl($ticket, $type),
@@ -927,7 +1247,7 @@ class ParkingController extends Controller
     private function whatsappReceiptUrl(ParkingTicket $ticket, string $type): string
     {
         $ticket->loadMissing(['site', 'payment', 'tariffProfile']);
-        $summary = $this->calculateTicket($ticket);
+        $summary = $this->displaySummary($ticket);
         $businessName = Str::upper('Parqueadero Donde Richard');
         $location = $this->formatReceiptLocation($ticket);
         $locker = $ticket->uses_locker
@@ -1019,6 +1339,8 @@ class ParkingController extends Controller
 
         Cache::put('portal_sync_last_run', now()->toDateTimeString(), now()->addMinutes($intervalMinutes));
 
+        $this->queueMonthlyMembershipPortalSync();
+
         $jobs = PortalSyncJob::query()
             ->whereIn('status', ['pending', 'failed'])
             ->where(function (Builder $query): void {
@@ -1089,18 +1411,141 @@ class ParkingController extends Controller
         });
     }
 
+    private function scopedMonthlyMemberships(): Builder
+    {
+        $user = auth()->user();
+
+        return MonthlyMembership::query()
+            ->when(! $user->isAdmin(), fn(Builder $query) => $query->where('site_id', $user->site_id));
+    }
+
+    private function findMonthlyMembershipByPlate(string $plate): ?MonthlyMembership
+    {
+        $plate = Str::upper(str_replace(' ', '', trim($plate)));
+        if ($plate === '') {
+            return null;
+        }
+
+        return $this->scopedMonthlyMemberships()
+            ->with(['tariffProfile', 'payments'])
+            ->where('plate', $plate)
+            ->latest('updated_at')
+            ->first();
+    }
+
     private function ticketLookupQuery(string $lookup): Builder
     {
-        return $this->scopedTickets()->where(function (Builder $query) use ($lookup) {
+        $compactLookup = $this->barcodeValueFromTicketCode($lookup);
+
+        return $this->scopedTickets()->where(function (Builder $query) use ($lookup, $compactLookup) {
             $query->where('ticket_code', $lookup)
                 ->orWhere('barcode', $lookup)
-                ->orWhere('plate', $lookup);
+                ->orWhere('plate', $lookup)
+                ->orWhereRaw("REPLACE(ticket_code, '-', '') = ?", [$compactLookup])
+                ->orWhereRaw("REPLACE(barcode, '-', '') = ?", [$compactLookup]);
         })->latest('entry_time');
     }
 
     private function pendingPaymentsData(): Collection
     {
         return $this->scopedPayments()->with('ticket')->where('status', 'pending')->latest('updated_at')->take(10)->get();
+    }
+
+    private function monthlyMembershipStats(): array
+    {
+        $base = $this->scopedMonthlyMemberships();
+        $today = today();
+
+        return [
+            'all' => (clone $base)->count(),
+            'active' => (clone $base)->where('status', '!=', 'cancelled')->whereDate('next_payment_date', '>=', $today)->count(),
+            'overdue' => (clone $base)->where('status', '!=', 'cancelled')->whereDate('next_payment_date', '<', $today)->count(),
+            'due' => (clone $base)->where('status', '!=', 'cancelled')->whereBetween('next_payment_date', [$today, $today->copy()->addDays(5)])->count(),
+            'paid' => MonthlyMembershipPayment::query()
+                ->whereHas('membership', fn(Builder $query) => $query->whereIn('id', (clone $base)->select('id')))
+                ->whereDate('paid_at', today())
+                ->sum('amount'),
+            'cancelled' => (clone $base)->where('status', 'cancelled')->count(),
+        ];
+    }
+
+    private function validateMonthlyMembership(Request $request, ?MonthlyMembership $membership = null): array
+    {
+        return $request->validate([
+            'tariff_profile_id' => ['required', 'exists:tariff_profiles,id'],
+            'customer_name' => ['required', 'string', 'max:255'],
+            'plate' => ['required', 'string', 'max:12'],
+            'vehicle_type' => ['required', 'in:moto,auto,bicicleta'],
+            'vehicle_brand' => ['nullable', 'string', 'max:80'],
+            'phone' => ['nullable', 'string', 'max:30'],
+            'starts_at' => ['required', 'date'],
+            'next_payment_date' => ['required', 'date'],
+            'notes' => ['nullable', 'string', 'max:1000'],
+            'status' => [$membership ? 'required' : 'nullable', 'in:active,cancelled'],
+        ]);
+    }
+
+    private function isMonthlyTariff(int $tariffId): bool
+    {
+        return TariffProfile::query()
+            ->whereKey($tariffId)
+            ->where('tariff_type', 'mensualidad')
+            ->exists();
+    }
+
+    private function monthlyMembershipNotice(MonthlyMembership $membership): array
+    {
+        $status = $membership->currentStatus();
+        $days = $membership->daysOverdue();
+
+        return [
+            'status' => $status,
+            'type' => match ($status) {
+                'active' => 'success',
+                'overdue' => 'warning',
+                'cancelled' => 'danger',
+                default => 'info',
+            },
+            'title' => match ($status) {
+                'active' => 'Mensualidad activa',
+                'overdue' => 'Mensualidad vencida',
+                'cancelled' => 'Mensualidad cancelada',
+                default => 'Mensualidad',
+            },
+            'message' => match ($status) {
+                'active' => 'La placa ' . $membership->plate . ' tiene mensualidad al dia. Proximo pago: ' . optional($membership->next_payment_date)->format('d/m/Y') . '.',
+                'overdue' => 'La placa ' . $membership->plate . ' esta pendiente por pagar. Dias vencidos: ' . $days . '.',
+                'cancelled' => 'La placa ' . $membership->plate . ' tiene una mensualidad cancelada.',
+                default => 'La placa ' . $membership->plate . ' tiene mensualidad registrada.',
+            },
+        ];
+    }
+
+    private function monthlyMembershipModal(MonthlyMembership $membership, string $titlePrefix): array
+    {
+        $notice = $this->monthlyMembershipNotice($membership);
+
+        return [
+            'type' => $notice['type'],
+            'title' => $titlePrefix . ' - ' . $notice['title'],
+            'message' => $notice['message'],
+            'large' => $notice['status'] === 'overdue',
+        ];
+    }
+
+    private function recordMonthlyActivity(MonthlyMembership $membership, ParkingTicket $ticket, string $eventType, ?string $notes = null): void
+    {
+        MonthlyMembershipActivity::create([
+            'monthly_membership_id' => $membership->id,
+            'parking_ticket_id' => $ticket->id,
+            'event_type' => $eventType,
+            'plate' => $ticket->plate,
+            'ticket_code' => $ticket->ticket_code,
+            'occurred_at' => $eventType === 'salida' ? ($ticket->exit_time ?: now()) : ($ticket->entry_time ?: now()),
+            'notes' => $notes,
+        ]);
+
+        $this->syncMonthlyMembership($membership->fresh(['site', 'tariffProfile', 'payments', 'activities']), 'mensualidad_' . $eventType);
     }
 
     private function syncPortalTicket(?ParkingTicket $ticket, string $event, ?array $summary = null): void
@@ -1162,6 +1607,97 @@ class ParkingController extends Controller
             );
         } catch (\Throwable) {
             // La operacion local no depende del portal ni de la cola de sincronizacion.
+        }
+    }
+
+    private function syncMonthlyMembership(?MonthlyMembership $membership, string $event, ?MonthlyMembershipPayment $payment = null): void
+    {
+        if (! $membership) {
+            return;
+        }
+
+        $url = (string) env('PORTAL_SYNC_URL', 'https://ingedev94.com/portalricardo/sync.php');
+        if ($url === '') {
+            return;
+        }
+
+        $membership->loadMissing(['site', 'tariffProfile', 'payments', 'activities']);
+        $lastPayment = $payment ?: $membership->payments->sortByDesc('paid_at')->first();
+        $lastActivity = $membership->activities->sortByDesc('occurred_at')->first();
+
+        $payload = [
+            'token' => (string) env('PORTAL_SYNC_TOKEN', 'cambia-este-token'),
+            'event_type' => $event,
+            'event_time' => now()->toDateTimeString(),
+            'monthly_membership' => [
+                'source_membership_id' => (string) $membership->id,
+                'plate' => $membership->plate,
+                'customer_name' => $membership->customer_name,
+                'vehicle_type' => $membership->vehicle_type,
+                'vehicle_brand' => $membership->vehicle_brand,
+                'phone' => $membership->phone,
+                'site_name' => $membership->site?->name ?? 'Principal',
+                'tariff_name' => $membership->tariffProfile?->name ?? 'Sin tarifa',
+                'tariff_amount' => (int) ($membership->tariffProfile?->unit_rate ?? 0),
+                'starts_at' => optional($membership->starts_at)->toDateString(),
+                'next_payment_date' => optional($membership->next_payment_date)->toDateString(),
+                'status' => $membership->currentStatus(),
+                'days_overdue' => $membership->daysOverdue(),
+                'last_payment_code' => $lastPayment?->receipt_code,
+                'last_payment_amount' => (int) ($lastPayment?->amount ?? 0),
+                'last_paid_at' => optional($lastPayment?->paid_at)->toDateTimeString(),
+                'last_activity_type' => $lastActivity?->event_type,
+                'last_activity_at' => optional($lastActivity?->occurred_at)->toDateTimeString(),
+                'notes' => $membership->notes,
+                'synced_at' => now()->toDateTimeString(),
+            ],
+        ];
+
+        if ($lastPayment) {
+            $payload['monthly_payment'] = [
+                'source_payment_id' => (string) $lastPayment->id,
+                'receipt_code' => $lastPayment->receipt_code,
+                'method' => $lastPayment->method,
+                'amount' => (int) $lastPayment->amount,
+                'period_start' => optional($lastPayment->period_start)->toDateString(),
+                'period_end' => optional($lastPayment->period_end)->toDateString(),
+                'paid_at' => optional($lastPayment->paid_at)->toDateTimeString(),
+            ];
+        }
+
+        try {
+            PortalSyncJob::updateOrCreate(
+                ['ticket_code' => 'MENS-' . $membership->id],
+                [
+                    'parking_ticket_id' => null,
+                    'event_type' => $event,
+                    'payload' => $payload,
+                    'status' => 'pending',
+                    'last_error' => null,
+                    'available_at' => now(),
+                    'synced_at' => null,
+                ]
+            );
+        } catch (\Throwable) {
+            //
+        }
+    }
+
+    private function queueMonthlyMembershipPortalSync(): void
+    {
+        try {
+            MonthlyMembership::query()
+                ->with(['site', 'tariffProfile', 'payments', 'activities'])
+                ->where(function (Builder $query): void {
+                    $query->where('status', '!=', 'cancelled')
+                        ->orWhere('updated_at', '>=', now()->subDay());
+                })
+                ->orderBy('next_payment_date')
+                ->limit(100)
+                ->get()
+                ->each(fn(MonthlyMembership $membership) => $this->syncMonthlyMembership($membership, 'mensualidad_estado'));
+        } catch (\Throwable) {
+            //
         }
     }
 
@@ -1358,6 +1894,34 @@ class ParkingController extends Controller
             'total' => $total,
         ];
     }
+
+    private function displaySummary(ParkingTicket $ticket): array
+    {
+        $summary = $this->calculateTicket($ticket);
+
+        if ($ticket->payment) {
+            $summary['subtotal'] = (int) $ticket->payment->subtotal;
+            $summary['discount'] = (int) $ticket->payment->discount;
+            $summary['surcharge'] = (int) $ticket->payment->surcharge;
+            $summary['tax'] = (int) $ticket->payment->tax;
+            $summary['total'] = (int) $ticket->payment->total;
+        }
+
+        return $summary;
+    }
+
+    private function receiptBarcodeValue(ParkingTicket $ticket): string
+    {
+        return $this->barcodeValueFromTicketCode($ticket->barcode ?: $ticket->ticket_code);
+    }
+
+    private function barcodeValueFromTicketCode(string $ticketCode): string
+    {
+        $value = preg_replace('/[^A-Z0-9]/', '', Str::upper($ticketCode)) ?? '';
+
+        return $value !== '' ? $value : 'SINCODIGO';
+    }
+
     public function deleteTariff(TariffProfile $tariff): RedirectResponse
     {
         $this->authorizeAdmin();
@@ -1376,7 +1940,7 @@ class ParkingController extends Controller
         return $request->validate([
             'name' => ['required', 'string', 'max:255'],
             'vehicle_type' => ['required', 'in:moto,auto,bicicleta'],
-            'type' => ['required', 'in:normal,plena,convenio'],
+            'type' => ['required', 'in:normal,plena,convenio,mensualidad'],
             'threshold_minutes' => ['required_if:type,plena', 'nullable', 'integer', 'min:1'],
             'max_minutes' => ['required_if:type,convenio', 'nullable', 'integer', 'min:1'],
             'full_rate' => ['required_if:type,plena', 'nullable', 'integer', 'min:0'],
@@ -1406,6 +1970,7 @@ class ParkingController extends Controller
             'billing_mode' => match ($data['type']) {
                 'plena' => 'Tarifa plena',
                 'convenio' => 'Convenio por tiempo',
+                'mensualidad' => 'Mensualidad',
                 default => 'Cobro por minuto',
             },
 
@@ -1426,7 +1991,7 @@ class ParkingController extends Controller
                 : null,
 
             'is_full_rate' => $data['type'] === 'plena',
-            'is_agreement' => $data['type'] === 'convenio',
+            'is_agreement' => in_array($data['type'], ['convenio', 'mensualidad'], true),
             'agreement_hours' => $data['type'] === 'convenio'
                 ? (int) ceil(((int) ($data['max_minutes'] ?? 0)) / 60)
                 : null,
@@ -1494,7 +2059,7 @@ class ParkingController extends Controller
         }
 
         $ticket->loadMissing(['site', 'payment', 'tariffProfile']);
-        $summary = $this->calculateTicket($ticket);
+        $summary = $this->displaySummary($ticket);
         $rawPath = $this->temporaryPrintPath($ticket, $type, 'bin');
         $scriptPath = $this->temporaryPrintPath($ticket, $type, 'ps1');
 
@@ -1594,18 +2159,22 @@ class ParkingController extends Controller
             '$doc.PrinterSettings.PrinterName = $printerName',
             '$doc.DefaultPageSettings.PaperSize = New-Object System.Drawing.Printing.PaperSize("Receipt80", 315, 1100)',
             '$doc.DefaultPageSettings.Margins = New-Object System.Drawing.Printing.Margins(0, 0, 0, 0)',
-            '$businessPhone = ' . $this->powerShellString((string) config('app.parking_phone', env('PARKING_PHONE', '3151'))),
-            '$businessAddress = ' . $this->powerShellString((string) config('app.parking_address', env('PARKING_ADDRESS', 'Calle 57 dsaj'))),
+            '$businessPhone = ' . $this->powerShellString((string) config('app.parking_phone', env('PARKING_PHONE', '3237902525'))),
+            '$businessAddress = ' . $this->powerShellString((string) config('app.parking_address', env('PARKING_ADDRESS', 'Cra 71a #8 - 43 sur'))),
+            '$businessRegime = "Regimen simplificado"',
+            '$businessNit = "NIT 7662483-1"',
             '$receiptType = ' . $this->powerShellString($type),
             '$location = ' . $this->powerShellString($this->formatReceiptLocation($ticket)),
+            '$locker = ' . $this->powerShellString($ticket->uses_locker ? 'SI - LOCKER ' . ($ticket->locker_number ?: 'N/A') : 'NO'),
             '$plate = ' . $this->powerShellString($ticket->plate),
-            '$entryDate = ' . $this->powerShellString((string) optional($ticket->entry_time)->format('d/m/Y h:i A')),
+            '$entryDate = ' . $this->powerShellString((string) optional($ticket->entry_time)->format('d/m/Y')),
+            '$entryHour = ' . $this->powerShellString((string) optional($ticket->entry_time)->format('h:i A')),
             '$exitDate = ' . $this->powerShellString((string) optional($ticket->exit_time)->format('d/m/Y h:i A')),
             '$duration = ' . $this->powerShellString($this->formatReceiptDuration((int) $summary['minutes'])),
-            '$tariff = ' . $this->powerShellString(strtoupper($type === 'salida' ? $summary['applied_tariff'] : ($ticket->tariffProfile?->name ?? 'SIN TARIFA'))),
-            '$pricing = ' . $this->powerShellString(strtoupper($summary['pricing_label'] ?? '')),
             '$total = ' . $this->powerShellString($this->money((int) $summary['total'])),
+            '$paymentMethod = ' . $this->powerShellString(strtoupper($ticket->payment?->method ?? 'N/A')),
             '$ticketCode = ' . $this->powerShellString($ticket->ticket_code),
+            '$barcodeValue = ' . $this->powerShellString($this->receiptBarcodeValue($ticket)),
             '$patternsJson = ' . $this->powerShellString((string) $barcodePatterns),
             '$patterns = ConvertFrom-Json $patternsJson',
             '$doc.add_PrintPage({',
@@ -1614,10 +2183,10 @@ class ParkingController extends Controller
             '    $g.PageUnit = [System.Drawing.GraphicsUnit]::Pixel',
             '    $black = [System.Drawing.Brushes]::Black',
             '    $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::Black, 2)',
-            '    $font = New-Object System.Drawing.Font("Arial", 11)',
-            '    $fontBold = New-Object System.Drawing.Font("Arial", 12, [System.Drawing.FontStyle]::Bold)',
+            '    $font = New-Object System.Drawing.Font("Arial", 9)',
+            '    $fontBold = New-Object System.Drawing.Font("Arial", 10, [System.Drawing.FontStyle]::Bold)',
             '    $fontBig = New-Object System.Drawing.Font("Arial", 20, [System.Drawing.FontStyle]::Bold)',
-            '    $fontTitle = New-Object System.Drawing.Font("Arial", 18, [System.Drawing.FontStyle]::Bold)',
+            '    $fontTitle = New-Object System.Drawing.Font("Arial", 12, [System.Drawing.FontStyle]::Bold)',
             '    $x = 14; $w = 287; $script:y = 12',
             '    function CenterText($text, $fontUse) {',
             '        $size = $g.MeasureString($text, $fontUse)',
@@ -1626,15 +2195,15 @@ class ParkingController extends Controller
             '    }',
             '    function LeftText($text, $fontUse) {',
             '        $g.DrawString($text, $fontUse, $black, [float]$x, [float]$script:y)',
-            '        $script:y += [int]$fontUse.GetHeight($g) + 3',
+            '        $script:y += [int]$fontUse.GetHeight($g) + 1',
             '    }',
             '    function Rule() {',
             '        $g.DrawLine($pen, $x, $script:y, $x + $w, $script:y)',
-            '        $script:y += 9',
+            '        $script:y += 6',
             '    }',
             '    function Barcode($value) {',
             '        $encoded = "*" + $value.ToUpper() + "*"',
-            '        $narrow = 1; $wide = 3; $height = 58',
+            '        $narrow = 1; $wide = 3; $height = 96',
             '        $total = 0',
             '        foreach ($ch in $encoded.ToCharArray()) { $patternForTotal = $patterns.PSObject.Properties[[string]$ch].Value; foreach ($p in $patternForTotal.ToCharArray()) { $total += $(if ($p -eq "w") { $wide } else { $narrow }) }; $total += $narrow }',
             '        $bx = [int]($x + (($w - $total) / 2))',
@@ -1650,45 +2219,38 @@ class ParkingController extends Controller
             '        $script:y += $height + 3',
             '        CenterText $value $font',
             '    }',
-            '    CenterText "PARQUEADERO" $fontTitle',
-            '    CenterText "DONDE RICHARD" $fontTitle',
-            '    CenterText ("Tel: " + $businessPhone) $font',
-            '    CenterText ("Direccion: " + $businessAddress) $font',
-            '    Rule',
-            '    CenterText $(if ($receiptType -eq "ingreso") { "RECIBO DE INGRESO" } else { "RECIBO DE SALIDA" }) $fontTitle',
-            '    Rule',
-            '    LeftText "UBICACION VEHICULO:" $fontBold',
-            '    LeftText $location $font',
+            '    CenterText "PARQUEADERO DONDE RICHARD" $fontTitle',
+            '    CenterText $businessRegime $font',
+            '    CenterText $businessNit $font',
+            '    CenterText $businessAddress $font',
+            '    CenterText $businessPhone $font',
             '    Rule',
             '    LeftText "PLACA:" $fontBold',
             '    LeftText $plate $fontBig',
-            '    Rule',
-            '    LeftText "FECHA ENTRADA:" $fontBold',
-            '    LeftText $entryDate $font',
+            '    LeftText ("FECHA: " + $entryDate) $font',
+            '    LeftText ("HORA: " + $entryHour) $font',
+            '    LeftText ("UBICACION: " + $location) $font',
+            '    LeftText ("LOCKER: " + $locker) $font',
             '    if ($receiptType -eq "salida") {',
-            '        LeftText "FECHA SALIDA:" $fontBold',
-            '        LeftText $exitDate $font',
+            '        LeftText ("SALIDA: " + $exitDate) $font',
             '        Rule',
             '        LeftText "TIEMPO TOTAL:" $fontBold',
             '        LeftText $duration $font',
-            '        LeftText "TARIFA:" $fontBold',
-            '        LeftText ($tariff + " - " + $pricing) $font',
+            '        LeftText ("TIPO DE PAGO: " + $paymentMethod) $fontBold',
             '        Rule',
-            '        CenterText "VALOR TOTAL:" $fontBold',
+            '        CenterText "VALOR A PAGAR:" $fontBold',
             '        CenterText $total $fontBig',
             '        Rule',
+            '        CenterText "SOFTWARE POR INGEDEVSOLUTIONS" $font',
             '        CenterText "GRACIAS POR SU VISITA!" $fontBold',
             '    } else {',
-            '        LeftText "TARIFA:" $fontBold',
-            '        LeftText $tariff $font',
             '        Rule',
-            '        CenterText "TICKET N:" $fontBold',
-            '        CenterText $ticketCode $fontBig',
-            '        Barcode $ticketCode',
+            '        CenterText $ticketCode $fontBold',
+            '        Barcode $barcodeValue',
             '        Rule',
-            '        LeftText "IMPORTANTE" $fontBold',
-            '        LeftText "- Conserve este recibo." $font',
-            '        LeftText "- Presente este ticket para salida." $font',
+            '        CenterText "Horario lunes a sabado 5:30am a 10:30pm" $font',
+            '        CenterText "Domingos y festivos 7am a 10pm" $font',
+            '        CenterText "Software por ingedevsolutions" $font',
             '    }',
             '    $e.HasMorePages = $false',
             '})',
@@ -1707,7 +2269,7 @@ class ParkingController extends Controller
     private function sendPlainTextReceiptToDefaultPrinter(ParkingTicket $ticket, string $type): bool
     {
         $ticket->loadMissing(['site', 'payment', 'tariffProfile']);
-        $summary = $this->calculateTicket($ticket);
+        $summary = $this->displaySummary($ticket);
         $textPath = $this->temporaryPrintPath($ticket, $type, 'txt');
         $scriptPath = $this->temporaryPrintPath($ticket, $type, 'ps1');
 
@@ -1754,43 +2316,43 @@ class ParkingController extends Controller
     private function thermalReceiptText(ParkingTicket $ticket, string $type, array $summary): string
     {
         $line = str_repeat('-', 32);
-        $title = $type === 'ingreso' ? 'RECIBO DE INGRESO' : 'RECIBO DE SALIDA';
+        $locker = $ticket->uses_locker ? 'SI - LOCKER ' . ($ticket->locker_number ?: 'N/A') : 'NO';
         $rows = [
-            $line,
             'PARQUEADERO DONDE RICHARD',
-            'Tel: ' . config('app.parking_phone', env('PARKING_PHONE', '3151')),
-            'Direccion: ' . config('app.parking_address', env('PARKING_ADDRESS', 'Calle 57 dsaj')),
+            'Regimen simplificado',
+            'NIT 7662483-1',
+            config('app.parking_address', env('PARKING_ADDRESS', 'Cra 71a #8 - 43 sur')),
+            config('app.parking_phone', env('PARKING_PHONE', '3237902525')),
             $line,
-            $title,
-            $line,
-            'UBICACION VEHICULO:',
-            $this->formatReceiptLocation($ticket),
-            '',
             'PLACA: ' . $ticket->plate,
-            'ENTRADA: ' . optional($ticket->entry_time)->format('d/m/Y h:i A'),
+            'FECHA: ' . optional($ticket->entry_time)->format('d/m/Y'),
+            'HORA: ' . optional($ticket->entry_time)->format('h:i A'),
+            'UBICACION: ' . $this->formatReceiptLocation($ticket),
+            'LOCKER: ' . $locker,
         ];
 
         if ($type === 'salida') {
             $rows = array_merge($rows, [
+                $line,
                 'SALIDA:  ' . optional($ticket->exit_time)->format('d/m/Y h:i A'),
                 'TIEMPO:  ' . $this->formatReceiptDuration((int) $summary['minutes']),
-                'TARIFA:  ' . strtoupper($summary['applied_tariff']),
+                'TIPO DE PAGO: ' . strtoupper($ticket->payment?->method ?? 'N/A'),
                 $line,
-                'VALOR TOTAL: ' . $this->money((int) $summary['total']),
+                'VALOR A PAGAR: ' . $this->money((int) $summary['total']),
             ]);
         } else {
             $rows = array_merge($rows, [
-                'TARIFA: ' . strtoupper($ticket->tariffProfile?->name ?? 'SIN TARIFA'),
                 $line,
                 'TICKET N: ' . $ticket->ticket_code,
-                'CODIGO:   ' . $ticket->ticket_code,
+                'CODIGO:   ' . $this->receiptBarcodeValue($ticket),
             ]);
         }
 
         $rows = array_merge($rows, [
             $line,
-            $type === 'ingreso' ? 'CONSERVE ESTE RECIBO.' : 'GRACIAS POR SU VISITA!',
-            $line,
+            $type === 'ingreso' ? 'Horario lunes a sabado 5:30am a 10:30pm' : 'GRACIAS POR SU VISITA!',
+            $type === 'ingreso' ? 'Domingos y festivos 7am a 10pm' : 'Software por ingedevsolutions',
+            $type === 'ingreso' ? 'Software por ingedevsolutions' : '',
             '',
             '',
             '',
@@ -1990,72 +2552,62 @@ class ParkingController extends Controller
     private function thermalReceiptBytes(ParkingTicket $ticket, string $type, array $summary): string
     {
         $line = str_repeat('-', 32);
+        $entryDate = optional($ticket->entry_time)->format('d/m/Y');
+        $entryHour = optional($ticket->entry_time)->format('h:i A');
+        $locker = $ticket->uses_locker ? 'SI - LOCKER ' . ($ticket->locker_number ?: 'N/A') : 'NO';
         $content = '';
 
         $content .= "\x1B@";              // Inicializar impresora.
         $content .= "\x1B\x74\x10";       // Tabla de caracteres compatible con acentos en muchas ESC/POS.
         $content .= "\x1B\x61\x01";       // Centrado.
-        $content .= "\x1B\x21\x30";       // Doble alto/ancho.
-        $content .= $this->thermalTextLine('PARQUEADERO');
-        $content .= $this->thermalTextLine('DONDE RICHARD');
+        $content .= "\x1B\x21\x08";       // Enfatizado.
+        $content .= $this->thermalTextLine('PARQUEADERO DONDE RICHARD');
         $content .= "\x1B\x21\x00";
-        $content .= $this->thermalTextLine('Tel: ' . config('app.parking_phone', env('PARKING_PHONE', '3151')));
-        $content .= $this->thermalTextLine('Direccion: ' . config('app.parking_address', env('PARKING_ADDRESS', 'Calle 57 dsaj')));
-        $content .= $this->thermalTextLine($line);
-        $content .= "\x1B\x21\x20";
-        $content .= $this->thermalTextLine($type === 'ingreso' ? 'RECIBO DE INGRESO' : 'RECIBO DE SALIDA');
-        $content .= "\x1B\x21\x00";
+        $content .= $this->thermalTextLine('Regimen simplificado');
+        $content .= $this->thermalTextLine('NIT 7662483-1');
+        $content .= $this->thermalTextLine(config('app.parking_address', env('PARKING_ADDRESS', 'Cra 71a #8 - 43 sur')));
+        $content .= $this->thermalTextLine(config('app.parking_phone', env('PARKING_PHONE', '3237902525')));
         $content .= $this->thermalTextLine($line);
 
         $content .= "\x1B\x61\x00";       // Alineado izquierda.
-        $content .= $this->thermalTextLine('UBICACION VEHICULO:');
-        $content .= $this->thermalTextLine($this->formatReceiptLocation($ticket));
-        $content .= $this->thermalTextLine($line);
         $content .= $this->thermalTextLine('PLACA:');
         $content .= "\x1B\x21\x30";
         $content .= $this->thermalTextLine($ticket->plate);
         $content .= "\x1B\x21\x00";
-        $content .= $this->thermalTextLine($line);
-        $content .= $this->thermalTextLine('FECHA ENTRADA:');
-        $content .= $this->thermalTextLine(optional($ticket->entry_time)->format('d/m/Y h:i A'));
+        $content .= $this->thermalTextLine('FECHA: ' . $entryDate);
+        $content .= $this->thermalTextLine('HORA: ' . $entryHour);
+        $content .= $this->thermalTextLine('UBICACION: ' . $this->formatReceiptLocation($ticket));
+        $content .= $this->thermalTextLine('LOCKER: ' . $locker);
 
         if ($type === 'salida') {
-            $content .= $this->thermalTextLine('FECHA SALIDA:');
-            $content .= $this->thermalTextLine(optional($ticket->exit_time)->format('d/m/Y h:i A'));
             $content .= $this->thermalTextLine($line);
-            $content .= $this->thermalTextLine('TIEMPO TOTAL:');
+            $content .= $this->thermalTextLine('SALIDA: ' . optional($ticket->exit_time)->format('d/m/Y h:i A'));
+            $content .= $this->thermalTextLine('TIEMPO:');
             $content .= $this->thermalTextLine($this->formatReceiptDuration((int) $summary['minutes']));
-            $content .= $this->thermalTextLine('TARIFA:');
-            $content .= $this->thermalTextLine(strtoupper($summary['applied_tariff']));
-            $content .= $this->thermalTextLine(strtoupper($summary['pricing_label']));
+            $content .= $this->thermalTextLine('TIPO DE PAGO: ' . strtoupper($ticket->payment?->method ?? 'N/A'));
             $content .= $this->thermalTextLine($line);
             $content .= "\x1B\x61\x01";
-            $content .= $this->thermalTextLine('VALOR TOTAL:');
+            $content .= $this->thermalTextLine('VALOR A PAGAR:');
             $content .= "\x1B\x21\x30";
             $content .= $this->thermalTextLine($this->money((int) $summary['total']));
             $content .= "\x1B\x21\x00";
             $content .= $this->thermalTextLine($line);
-            $content .= $this->thermalTextLine('GRACIAS POR SU VISITA!');
+            $content .= $this->thermalTextLine('Software por ingedevsolutions');
         } else {
-            $content .= $this->thermalTextLine('TARIFA:');
-            $content .= $this->thermalTextLine(strtoupper($ticket->tariffProfile?->name ?? 'SIN TARIFA'));
             $content .= $this->thermalTextLine($line);
             $content .= "\x1B\x61\x01";
-            $content .= $this->thermalTextLine('TICKET N:');
-            $content .= "\x1B\x21\x30";
+            $content .= "\x1B\x21\x08";
             $content .= $this->thermalTextLine($ticket->ticket_code);
             $content .= "\x1B\x21\x00";
             $content .= "\x1D\x48\x02";   // HRI debajo del codigo.
-            $content .= "\x1D\x68\x50";   // Altura del codigo de barras.
-            $content .= "\x1D\x77\x02";   // Ancho del codigo de barras.
-            $content .= "\x1D\x6B\x04" . $this->sanitizeCode39($ticket->ticket_code) . "\x00";
+            $content .= "\x1D\x68\x78";   // Altura grande del codigo de barras.
+            $content .= "\x1D\x77\x03";   // Ancho grande del codigo de barras.
+            $content .= "\x1D\x6B\x04" . $this->sanitizeCode39($this->receiptBarcodeValue($ticket)) . "\x00";
             $content .= $this->thermalTextLine('');
             $content .= $this->thermalTextLine($line);
-            $content .= "\x1B\x61\x00";
-            $content .= $this->thermalTextLine('IMPORTANTE');
-            $content .= $this->thermalTextLine('- Conserve este recibo.');
-            $content .= $this->thermalTextLine('- Presente este ticket para salida.');
-            $content .= $this->thermalTextLine('- No se responde por objetos.');
+            $content .= $this->thermalTextLine('Horario lunes a sabado 5:30am a 10:30pm');
+            $content .= $this->thermalTextLine('Domingos y festivos 7am a 10pm');
+            $content .= $this->thermalTextLine('Software por ingedevsolutions');
         }
 
         $content .= "\x1B\x61\x01";
@@ -2170,6 +2722,34 @@ class ParkingController extends Controller
         $user = auth()->user();
 
         return $user->isAdmin() || $ticket->site_id === $user->site_id;
+    }
+
+    private function canAccessMonthlyMembership(MonthlyMembership $membership): bool
+    {
+        $user = auth()->user();
+
+        return $user->isAdmin() || $membership->site_id === $user->site_id;
+    }
+
+    private function nextMonthlyReceiptCode(): string
+    {
+        $date = now()->format('ymd');
+        $prefix = 'MENS-' . $date . '-';
+        $lastCode = MonthlyMembershipPayment::query()
+            ->where('receipt_code', 'like', $prefix . '%')
+            ->orderByDesc('receipt_code')
+            ->value('receipt_code');
+
+        $sequence = $lastCode
+            ? ((int) Str::afterLast($lastCode, '-')) + 1
+            : 1;
+
+        do {
+            $receiptCode = $prefix . str_pad((string) $sequence, 4, '0', STR_PAD_LEFT);
+            $sequence++;
+        } while (MonthlyMembershipPayment::query()->where('receipt_code', $receiptCode)->exists());
+
+        return $receiptCode;
     }
 
     private function authorizeAdmin(): void

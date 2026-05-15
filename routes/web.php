@@ -27,6 +27,13 @@ Route::middleware('auth')->group(function () {
         ->name('settings.tariff.delete');
     Route::middleware('role:admin')->group(function () {
         Route::get('/reportes', [ParkingController::class, 'reports'])->name('reports');
+        Route::get('/mensualidades', [ParkingController::class, 'monthlyMemberships'])->name('monthly.index');
+        Route::get('/mensualidades/datos', [ParkingController::class, 'monthlyMembershipsData'])->name('monthly.data');
+        Route::post('/mensualidades', [ParkingController::class, 'storeMonthlyMembership'])->name('monthly.store');
+        Route::put('/mensualidades/{membership}', [ParkingController::class, 'updateMonthlyMembership'])->name('monthly.update');
+        Route::post('/mensualidades/{membership}/pagar', [ParkingController::class, 'payMonthlyMembership'])->name('monthly.pay');
+        Route::post('/mensualidades/{membership}/cancelar', [ParkingController::class, 'cancelMonthlyMembership'])->name('monthly.cancel');
+        Route::get('/mensualidades/pagos/{payment}/recibo', [ParkingController::class, 'monthlyPaymentReceipt'])->name('monthly.receipt');
         Route::get('/configuracion', [ParkingController::class, 'settings'])->name('settings');
         Route::post('/configuracion/tarifas', [ParkingController::class, 'storeTariff'])->name('settings.tariff.store');
         Route::put('/configuracion/tarifas/{tariff}', [ParkingController::class, 'updateTariff'])->name('settings.tariff.update');

@@ -8,7 +8,7 @@ $user = portal_require_login();
 $isAdmin = ($user['role'] ?? '') === 'admin';
 
 $view = $_GET['view'] ?? 'dashboard';
-$allowedViews = ['dashboard', 'movimientos', 'activos', 'salidas', 'tarifas', 'graficas', 'usuarios'];
+$allowedViews = ['dashboard', 'movimientos', 'activos', 'salidas', 'tarifas', 'graficas', 'mensualidades', 'usuarios'];
 if (! in_array($view, $allowedViews, true) || ($view === 'usuarios' && ! $isAdmin)) {
     $view = 'dashboard';
 }
@@ -115,6 +115,7 @@ function portal_icon(string $name): string
         'tag' => '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12V4h8l10 10-7 7L3 12Zm5-5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z"/></svg>',
         'chart' => '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19h16v2H4v-2Zm1-2V9h3v8H5Zm5 0V4h3v13h-3Zm5 0v-6h3v6h-3Z"/></svg>',
         'users' => '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm0 2c4 0 6 2 6 4.5V20H2v-2.5C2 15 4 13 8 13Zm8.5-1a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Zm.2 1c3.2.1 5.3 1.8 5.3 4.1V20h-6v-2.5c0-1.5-.5-3-1.6-4.1.6-.3 1.4-.4 2.3-.4Z"/></svg>',
+        'monthly' => '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 2h10v2h3v18H4V4h3V2Zm2 2h6V3H9v1Zm-3 4v12h12V8H6Zm2 3h8v2H8v-2Zm0 4h5v2H8v-2Z"/></svg>',
     ];
 
     return $icons[$name] ?? $icons['home'];
@@ -210,6 +211,55 @@ if ($view === 'usuarios' && $isAdmin) {
     $users = $pdo->query('SELECT * FROM portal_users ORDER BY active DESC, name ASC')->fetchAll();
 }
 
+$monthlyStatus = $_GET['monthly_status'] ?? 'all';
+$monthlySearch = trim($_GET['monthly_search'] ?? '');
+$monthlyWhere = ['1 = 1'];
+$monthlyParams = [];
+if ($monthlyStatus === 'active') {
+    $monthlyWhere[] = "status <> 'cancelled' AND next_payment_date >= CURDATE()";
+} elseif ($monthlyStatus === 'overdue') {
+    $monthlyWhere[] = "status <> 'cancelled' AND next_payment_date < CURDATE()";
+} elseif ($monthlyStatus === 'cancelled') {
+    $monthlyWhere[] = "status = 'cancelled'";
+} elseif ($monthlyStatus === 'due') {
+    $monthlyWhere[] = "status <> 'cancelled' AND next_payment_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 5 DAY)";
+} elseif ($monthlyStatus === 'paid') {
+    $monthlyWhere[] = 'last_paid_at IS NOT NULL';
+}
+if ($monthlySearch !== '') {
+    $monthlyWhere[] = '(plate LIKE :monthly_search OR customer_name LIKE :monthly_search OR phone LIKE :monthly_search)';
+    $monthlyParams['monthly_search'] = '%' . strtoupper($monthlySearch) . '%';
+}
+$monthlyWhereSql = implode(' AND ', $monthlyWhere);
+$monthlyStats = [
+    'all' => 0,
+    'active' => 0,
+    'overdue' => 0,
+    'due' => 0,
+    'cancelled' => 0,
+    'paid' => 0,
+];
+$monthlyRows = [];
+if ($view === 'mensualidades' || $view === 'dashboard') {
+    try {
+        $monthlyStats = $pdo->query("
+            SELECT
+                COUNT(*) AS all_count,
+                SUM(CASE WHEN status <> 'cancelled' AND next_payment_date >= CURDATE() THEN 1 ELSE 0 END) AS active_count,
+                SUM(CASE WHEN status <> 'cancelled' AND next_payment_date < CURDATE() THEN 1 ELSE 0 END) AS overdue_count,
+                SUM(CASE WHEN status <> 'cancelled' AND next_payment_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 5 DAY) THEN 1 ELSE 0 END) AS due_count,
+                SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled_count,
+                SUM(CASE WHEN last_paid_at IS NOT NULL THEN last_payment_amount ELSE 0 END) AS paid_amount
+            FROM portal_monthly_memberships
+        ")->fetch() ?: $monthlyStats;
+        $stmt = $pdo->prepare("SELECT * FROM portal_monthly_memberships WHERE $monthlyWhereSql ORDER BY FIELD(status, 'overdue', 'active', 'cancelled'), next_payment_date ASC LIMIT 80");
+        $stmt->execute($monthlyParams);
+        $monthlyRows = $stmt->fetchAll();
+    } catch (Throwable) {
+        $monthlyRows = [];
+    }
+}
+
 $lastSync = $pdo->query('SELECT MAX(last_synced_at) AS last_sync FROM portal_tickets')->fetch()['last_sync'] ?? null;
 $nav = [
     'dashboard' => ['label' => 'Inicio', 'icon' => '⌂'],
@@ -229,6 +279,7 @@ $nav = [
     'activos' => ['label' => 'Activos', 'icon' => 'car'],
     'salidas' => ['label' => 'Salidas', 'icon' => 'cash'],
     'tarifas' => ['label' => 'Tarifas', 'icon' => 'tag'],
+    'mensualidades' => ['label' => 'Mensualidades', 'icon' => 'monthly'],
     'graficas' => ['label' => 'Graficas', 'icon' => 'chart'],
 ];
 if ($isAdmin) {
@@ -286,6 +337,7 @@ if ($isAdmin) {
                 <div class="notice success"><?= htmlspecialchars($notice) ?></div>
             <?php endif; ?>
 
+            <?php if ($view !== 'mensualidades'): ?>
             <section class="filter-card">
                 <form class="filter-grid" method="GET">
                     <input type="hidden" name="view" value="<?= htmlspecialchars($view) ?>">
@@ -313,13 +365,16 @@ if ($isAdmin) {
                     <button class="button" type="submit">Filtrar</button>
                 </form>
             </section>
+            <?php endif; ?>
 
+            <?php if ($view !== 'mensualidades'): ?>
             <section class="kpi-grid">
                 <article class="kpi accent"><span>Ingresos</span><strong><?= portal_money($stats['paid_income'] ?? 0) ?></strong><small>Pagos confirmados</small></article>
                 <article class="kpi"><span>Por cobrar</span><strong><?= portal_money($stats['pending_income'] ?? 0) ?></strong><small>Pendientes</small></article>
                 <article class="kpi"><span>Activos</span><strong><?= (int) ($stats['active_count'] ?? 0) ?></strong><small>En parqueadero</small></article>
                 <article class="kpi"><span>Movimientos</span><strong><?= (int) ($stats['tickets'] ?? 0) ?></strong><small>Periodo filtrado</small></article>
             </section>
+            <?php endif; ?>
 
             <?php if ($view === 'dashboard'): ?>
                 <section class="portal-grid">
@@ -483,6 +538,74 @@ if ($isAdmin) {
                                 <?php endforeach; ?>
                             </div>
                         </div>
+                    </div>
+                </section>
+            <?php endif; ?>
+
+            <?php if ($view === 'mensualidades'): ?>
+                <section class="filter-card">
+                    <form class="filter-grid" method="GET">
+                        <input type="hidden" name="view" value="mensualidades">
+                        <label>
+                            <span>Vista</span>
+                            <select name="monthly_status">
+                                <option value="all" <?= $monthlyStatus === 'all' ? 'selected' : '' ?>>Todos</option>
+                                <option value="due" <?= $monthlyStatus === 'due' ? 'selected' : '' ?>>Proximas a vencer</option>
+                                <option value="overdue" <?= $monthlyStatus === 'overdue' ? 'selected' : '' ?>>Vencidas</option>
+                                <option value="paid" <?= $monthlyStatus === 'paid' ? 'selected' : '' ?>>Pagadas</option>
+                                <option value="active" <?= $monthlyStatus === 'active' ? 'selected' : '' ?>>Activas</option>
+                                <option value="cancelled" <?= $monthlyStatus === 'cancelled' ? 'selected' : '' ?>>Canceladas</option>
+                            </select>
+                        </label>
+                        <label><span>Buscar</span><input type="text" name="monthly_search" value="<?= htmlspecialchars($monthlySearch) ?>" placeholder="Placa, nombre o telefono"></label>
+                        <button class="button" type="submit">Filtrar</button>
+                    </form>
+                </section>
+
+                <section class="kpi-grid">
+                    <article class="kpi accent"><span>Activas</span><strong><?= (int) ($monthlyStats['active_count'] ?? 0) ?></strong><small>Al dia</small></article>
+                    <article class="kpi"><span>Vencidas</span><strong><?= (int) ($monthlyStats['overdue_count'] ?? 0) ?></strong><small>Pendientes</small></article>
+                    <article class="kpi"><span>Por vencer</span><strong><?= (int) ($monthlyStats['due_count'] ?? 0) ?></strong><small>5 dias</small></article>
+                    <article class="kpi"><span>Pagadas</span><strong><?= portal_money($monthlyStats['paid_amount'] ?? 0) ?></strong><small>Ultimo pago sync</small></article>
+                </section>
+
+                <section class="portal-card">
+                    <div class="card-head">
+                        <div>
+                            <h3>Portal mensualidades</h3>
+                            <p>Activas, vencidas, pagadas, canceladas y actividad reciente.</p>
+                        </div>
+                        <div class="view-tabs">
+                            <a class="<?= $monthlyStatus === 'all' ? 'active' : '' ?>" href="?view=mensualidades&monthly_status=all">Todos</a>
+                            <a class="<?= $monthlyStatus === 'due' ? 'active' : '' ?>" href="?view=mensualidades&monthly_status=due">Proximas</a>
+                            <a class="<?= $monthlyStatus === 'overdue' ? 'active' : '' ?>" href="?view=mensualidades&monthly_status=overdue">Vencidas</a>
+                            <a class="<?= $monthlyStatus === 'paid' ? 'active' : '' ?>" href="?view=mensualidades&monthly_status=paid">Pagadas</a>
+                            <a class="<?= $monthlyStatus === 'cancelled' ? 'active' : '' ?>" href="?view=mensualidades&monthly_status=cancelled">Canceladas</a>
+                        </div>
+                    </div>
+                    <div class="record-list">
+                        <?php foreach ($monthlyRows as $monthly): ?>
+                            <?php
+                                $monthlyComputedStatus = $monthly['status'] === 'cancelled'
+                                    ? 'cancelled'
+                                    : ((isset($monthly['next_payment_date']) && $monthly['next_payment_date'] < date('Y-m-d')) ? 'overdue' : 'active');
+                            ?>
+                            <article class="record-card">
+                                <div>
+                                    <span class="ticket-code"><?= htmlspecialchars($monthly['tariff_name'] ?? 'Mensualidad') ?></span>
+                                    <strong><?= htmlspecialchars($monthly['plate']) ?></strong>
+                                    <small><?= htmlspecialchars($monthly['customer_name']) ?></small>
+                                </div>
+                                <span class="status <?= htmlspecialchars($monthlyComputedStatus) ?>"><?= htmlspecialchars($monthlyComputedStatus) ?></span>
+                                <div><small>Vehiculo</small><b><?= htmlspecialchars(strtoupper($monthly['vehicle_type'])) ?></b></div>
+                                <div><small>Pago</small><b><?= htmlspecialchars($monthly['next_payment_date'] ?? '--') ?></b></div>
+                                <div><small>Ultimo pago</small><b><?= portal_money($monthly['last_payment_amount'] ?? 0) ?></b></div>
+                                <div><small>Actividad</small><b><?= htmlspecialchars(($monthly['last_activity_type'] ?? 'Sin actividad') . ' ' . portal_date($monthly['last_activity_at'] ?? null, '')) ?></b></div>
+                            </article>
+                        <?php endforeach; ?>
+                        <?php if (count($monthlyRows) === 0): ?>
+                            <div class="notice">No hay mensualidades sincronizadas para esta vista.</div>
+                        <?php endif; ?>
                     </div>
                 </section>
             <?php endif; ?>
