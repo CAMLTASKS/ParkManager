@@ -6,6 +6,7 @@
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <meta name="portal-sync-url" content="{{ route('portal.sync.run') }}">
     <meta name="portal-sync-interval" content="{{ $portalSyncInterval ?? 5 }}">
+    <meta name="barcode-entry-url" content="{{ route('entry') }}">
     <title>{{ $pageTitle ?? $parkName }}</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>

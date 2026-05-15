@@ -183,6 +183,73 @@ document.querySelectorAll('[data-entry-prefill-route]').forEach((input) => {
     });
 });
 
+const globalBarcodeEntryUrl = document.querySelector('meta[name="barcode-entry-url"]')?.getAttribute('content');
+
+if (globalBarcodeEntryUrl) {
+    let barcodeBuffer = '';
+    let barcodeStartedAt = 0;
+    let barcodeLastKeyAt = 0;
+    let barcodeKeyCount = 0;
+
+    const resetBarcodeBuffer = () => {
+        barcodeBuffer = '';
+        barcodeStartedAt = 0;
+        barcodeLastKeyAt = 0;
+        barcodeKeyCount = 0;
+    };
+
+    const shouldIgnoreBarcodeTarget = (target) => {
+        if (!(target instanceof Element)) {
+            return false;
+        }
+
+        if (target.closest('[data-entry-prefill-route]')) {
+            return true;
+        }
+
+        return target.closest('textarea, select, [contenteditable="true"]') !== null;
+    };
+
+    document.addEventListener('keydown', (event) => {
+        if (event.defaultPrevented || event.ctrlKey || event.altKey || event.metaKey || event.isComposing) {
+            return;
+        }
+
+        const now = Date.now();
+        if (barcodeLastKeyAt && now - barcodeLastKeyAt > 180) {
+            resetBarcodeBuffer();
+        }
+
+        if (event.key === 'Enter') {
+            const value = barcodeBuffer.trim().toUpperCase();
+            const elapsed = barcodeStartedAt ? now - barcodeStartedAt : 0;
+            const averageDelay = barcodeKeyCount > 1 ? elapsed / barcodeKeyCount : elapsed;
+            const looksLikeScanner = value.length >= 4 && elapsed <= 1800 && averageDelay <= 120;
+            resetBarcodeBuffer();
+
+            if (!looksLikeScanner) {
+                return;
+            }
+
+            event.preventDefault();
+            window.location.href = `${globalBarcodeEntryUrl}?plate_lookup=${encodeURIComponent(value)}`;
+            return;
+        }
+
+        if (event.key.length !== 1 || shouldIgnoreBarcodeTarget(event.target)) {
+            return;
+        }
+
+        if (!barcodeStartedAt) {
+            barcodeStartedAt = now;
+        }
+
+        barcodeBuffer += event.key;
+        barcodeKeyCount += 1;
+        barcodeLastKeyAt = now;
+    }, true);
+}
+
 const monthlyPage = document.querySelector('[data-monthly-page]');
 
 if (monthlyPage) {
