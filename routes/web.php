@@ -38,6 +38,8 @@ Route::middleware('auth')->group(function () {
         Route::post('/configuracion/tarifas', [ParkingController::class, 'storeTariff'])->name('settings.tariff.store');
         Route::put('/configuracion/tarifas/{tariff}', [ParkingController::class, 'updateTariff'])->name('settings.tariff.update');
         Route::post('/configuracion/locker', [ParkingController::class, 'updateLockerSettings'])->name('settings.locker.update');
+        Route::post('/configuracion/parametros', [ParkingController::class, 'updateApplicationSettings'])->name('settings.parameters.update');
+        Route::post('/configuracion/backup', [ParkingController::class, 'backupDatabase'])->name('settings.backup');
         Route::get('/auditoria', [ParkingController::class, 'audit'])->name('audit');
         Route::post('/auditoria/usuarios', [ParkingController::class, 'storeUser'])->name('audit.users.store');
         Route::put('/auditoria/usuarios/{user}', [ParkingController::class, 'updateUser'])->name('audit.users.update');

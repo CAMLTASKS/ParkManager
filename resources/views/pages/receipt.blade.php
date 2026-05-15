@@ -6,7 +6,7 @@
     <title>{{ $pageTitle }} - {{ $ticket->ticket_code }}</title>
     <style>
         :root {
-            --paper-width: 72mm;
+            --paper-width: {{ ((int) ($printSettings['receipt_width_mm'] ?? 80)) === 58 ? '52mm' : '72mm' }};
             --ink: #000;
         }
 
@@ -167,14 +167,14 @@
         }
 
         @page {
-            size: 80mm auto;
+            size: {{ ((int) ($printSettings['receipt_width_mm'] ?? 80)) === 58 ? '58mm' : '80mm' }} auto;
             margin: 0;
         }
 
         @media print {
             html,
             body {
-                width: 80mm;
+                width: {{ ((int) ($printSettings['receipt_width_mm'] ?? 80)) === 58 ? '58mm' : '80mm' }};
                 min-height: auto;
                 padding: 0;
                 background: #fff;
@@ -189,7 +189,7 @@
             }
 
             .receipt-paper {
-                width: 72mm;
+                width: var(--paper-width);
                 max-width: none;
                 margin: 0 auto;
                 padding: 3mm 3.5mm 4mm;
@@ -201,7 +201,7 @@
 </head>
 <body>
     <div class="print-actions">
-        <a href="{{ route('tickets.print', ['ticket' => $ticket, 'type' => $receiptType, 'return_to' => 'transaction']) }}">Imprimir directo</a>
+        <a href="{{ route('tickets.print', ['ticket' => $ticket, 'type' => $receiptType, 'return_to' => 'transaction']) }}">{{ trim($printSettings['printer_name'] ?? '') !== '' ? 'Imprimir directo' : 'Imprimir' }}</a>
         <a href="{{ $whatsappReceiptUrl }}" target="_blank" rel="noopener" class="whatsapp-action">Enviar WhatsApp</a>
         <a href="{{ route('entry') }}">Volver a entrada</a>
         <a href="{{ route('transaction.show', $ticket) }}">Ver ticket</a>
@@ -265,6 +265,7 @@
         const autoReturn = @json($autoReturn);
         const autoClose = @json($autoClose ?? false);
         const returnUrl = @json($returnUrl ?? route('entry'));
+        const autoReturnSeconds = @json($autoReturnSeconds ?? 3);
         let returning = false;
 
         if (autoPrint) {
@@ -286,7 +287,7 @@
             returning = true;
             setTimeout(() => {
                 window.location.href = returnUrl;
-            }, 700);
+            }, Math.max(Number(autoReturnSeconds || 3), 1) * 1000);
         });
     </script>
 </body>

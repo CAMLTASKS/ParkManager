@@ -14,17 +14,35 @@ if (sidebarToggle) {
     });
 }
 
+const closeModalElement = (modal) => {
+    if (!modal) {
+        return;
+    }
+
+    if (modal.matches('[data-modal]')) {
+        modal.remove();
+        return;
+    }
+
+    modal.classList.remove('is-visible');
+};
+
 document.querySelectorAll('[data-modal-close]').forEach((button) => {
     button.addEventListener('click', () => {
         const modal = button.closest('[data-modal]');
-        if (modal) {
-            modal.remove();
-        }
+        closeModalElement(modal);
     });
 });
 
 document.addEventListener('click', (event) => {
     if (!(event.target instanceof Element)) {
+        return;
+    }
+
+    const backdrop = event.target.closest('[data-app-modal-id], [data-modal], #loadingOverlay');
+    if (backdrop && event.target === backdrop && (backdrop.classList.contains('is-visible') || backdrop.matches('[data-modal]'))) {
+        event.preventDefault();
+        closeModalElement(backdrop);
         return;
     }
 
@@ -42,11 +60,19 @@ document.addEventListener('click', (event) => {
     const closeButton = event.target.closest('[data-close-app-modal]');
     if (closeButton) {
         const modal = closeButton.closest('[data-app-modal-id]');
-        if (modal) {
-            event.preventDefault();
-            modal.classList.remove('is-visible');
-        }
+        event.preventDefault();
+        closeModalElement(modal);
     }
+});
+
+document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') {
+        return;
+    }
+
+    const visibleModals = Array.from(document.querySelectorAll('[data-app-modal-id].is-visible, [data-modal], #loadingOverlay.is-visible'));
+    const modal = visibleModals.pop();
+    closeModalElement(modal);
 });
 
 document.querySelectorAll('[data-loading-form]').forEach((form) => {

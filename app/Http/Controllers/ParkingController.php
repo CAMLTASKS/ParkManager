@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\AuditLog;
+use App\Models\ApplicationSetting;
 use App\Models\MonthlyMembership;
 use App\Models\MonthlyMembershipActivity;
 use App\Models\MonthlyMembershipPayment;
@@ -24,6 +25,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class ParkingController extends Controller
 {
@@ -692,6 +694,7 @@ class ParkingController extends Controller
             'tariffs' => $tariffs,
             'selectedTariff' => $selected,
             'currentSite' => auth()->user()?->site ?: Site::query()->first(),
+            'appSettings' => $this->applicationSettings(),
             'recentAudits' => AuditLog::query()->latest('logged_at')->take(12)->get(),
             'strategyOptions' => [
                 'fraction' => 'Tarifa por minuto',
@@ -728,6 +731,67 @@ class ParkingController extends Controller
                 'title' => 'Locker actualizado',
                 'message' => 'La tarifa fija del locker fue guardada correctamente.',
             ]);
+    }
+
+    public function updateApplicationSettings(Request $request): RedirectResponse
+    {
+        $this->authorizeAdmin();
+
+        $data = $request->validate([
+            'printer_name' => ['nullable', 'string', 'max:255'],
+            'receipt_width_mm' => ['required', 'integer', 'in:58,80'],
+            'receipt_copies' => ['required', 'integer', 'min:1', 'max:3'],
+            'auto_return_seconds' => ['required', 'integer', 'min:1', 'max:30'],
+            'backup_retention_days' => ['required', 'integer', 'min:1', 'max:365'],
+            'business_name' => ['required', 'string', 'max:120'],
+            'business_regime' => ['required', 'string', 'max:120'],
+            'business_nit' => ['required', 'string', 'max:80'],
+            'business_address' => ['required', 'string', 'max:160'],
+            'business_phone' => ['required', 'string', 'max:80'],
+        ]);
+
+        foreach ($data as $key => $value) {
+            ApplicationSetting::updateOrCreate(
+                ['key' => $key],
+                ['value' => is_string($value) ? trim($value) : (string) $value]
+            );
+        }
+
+        $this->logAction('parametros_actualizados', 'configuracion', 'Parametros generales de impresion y sistema actualizados.', null, $data);
+
+        return redirect()->route('settings')
+            ->with('modal', [
+                'type' => 'success',
+                'title' => 'Parametros guardados',
+                'message' => trim((string) ($data['printer_name'] ?? '')) !== ''
+                    ? 'La impresion directa quedo activa para la impresora configurada.'
+                    : 'Sin nombre de impresora, el sistema mostrara la ventana de impresion del navegador.',
+            ]);
+    }
+
+    public function backupDatabase(): StreamedResponse|RedirectResponse
+    {
+        $this->authorizeAdmin();
+
+        try {
+            $sql = $this->buildDatabaseBackupSql();
+        } catch (\Throwable $exception) {
+            return redirect()->route('settings')
+                ->with('modal', [
+                    'type' => 'danger',
+                    'title' => 'Backup no generado',
+                    'message' => 'No fue posible generar el backup: ' . $exception->getMessage(),
+                ]);
+        }
+
+        $filename = 'parkmanager-backup-' . now()->format('Ymd-His') . '.sql';
+        $this->logAction('backup_base_datos', 'configuracion', 'Backup de base de datos generado: ' . $filename);
+
+        return response()->streamDownload(function () use ($sql): void {
+            echo $sql;
+        }, $filename, [
+            'Content-Type' => 'application/sql; charset=UTF-8',
+        ]);
     }
 
     public function monthlyMemberships(Request $request): View
@@ -962,13 +1026,7 @@ class ParkingController extends Controller
             'pageSubtitle' => 'Comprobante de pago mensual.',
             'payment' => $payment,
             'membership' => $payment->membership,
-            'receiptBusiness' => [
-                'name' => 'PARQUEADERO DONDE RICHARD',
-                'regime' => 'Regimen simplificado',
-                'nit' => 'NIT 7662483-1',
-                'address' => config('app.parking_address', env('PARKING_ADDRESS', 'Cra 71a #8 - 43 sur')),
-                'phone' => config('app.parking_phone', env('PARKING_PHONE', '3237902525')),
-            ],
+            'receiptBusiness' => $this->receiptBusinessSettings(),
         ]));
     }
 
@@ -1179,21 +1237,29 @@ class ParkingController extends Controller
         abort_unless(in_array($type, ['ingreso', 'salida'], true), 404);
         abort_unless($this->canAccessTicket($ticket), 403);
 
-        $printed = false;
-        try {
-            $printed = $this->sendReceiptToDefaultPrinter($ticket, $type);
-        } catch (\Throwable) {
-            $printed = false;
-        }
         $redirect = request('return_to') === 'transaction'
             ? redirect()->route('transaction.show', $ticket)
             : redirect()->route('entry');
+        $settings = $this->applicationSettings();
+        $printerName = trim((string) ($settings['printer_name'] ?? ''));
 
-        if ($printed) {
+        if ($printerName !== '') {
+            $printed = true;
+            $copies = max(1, min(3, (int) ($settings['receipt_copies'] ?? 1)));
+            try {
+                for ($copy = 0; $copy < $copies; $copy++) {
+                    $printed = $this->sendReceiptToDefaultPrinter($ticket, $type, $printerName) && $printed;
+                }
+            } catch (\Throwable) {
+                $printed = false;
+            }
+
             return $redirect->with('modal', [
-                'type' => 'success',
-                'title' => 'Impresion enviada',
-                'message' => 'El recibo fue enviado a la impresora predeterminada.',
+                'type' => $printed ? 'success' : 'danger',
+                'title' => $printed ? 'Impresion enviada' : 'Impresion no enviada',
+                'message' => $printed
+                    ? 'El recibo fue enviado a la impresora ' . $printerName . '.'
+                    : 'No se pudo imprimir en ' . $printerName . '. Revisa el nombre configurado o el estado de la impresora.',
             ]);
         }
 
@@ -1210,6 +1276,7 @@ class ParkingController extends Controller
         $ticket->load(['site', 'payment', 'tariffProfile', 'creator', 'closer']);
         $summary = $this->displaySummary($ticket);
         $site = $ticket->site ?: auth()->user()?->site ?: Site::query()->first();
+        $appSettings = $this->applicationSettings();
 
         return $this->sharedData(array_merge([
             'pageTitle' => $type === 'ingreso' ? 'Recibo de ingreso' : 'Recibo de salida',
@@ -1218,13 +1285,8 @@ class ParkingController extends Controller
             'receiptType' => $type,
             'summary' => $summary,
             'site' => $site,
-            'receiptBusiness' => [
-                'name' => 'PARQUEADERO DONDE RICHARD',
-                'regime' => 'Regimen simplificado',
-                'nit' => 'NIT 7662483-1',
-                'address' => config('app.parking_address', env('PARKING_ADDRESS', 'Cra 71a #8 - 43 sur')),
-                'phone' => config('app.parking_phone', env('PARKING_PHONE', '3237902525')),
-            ],
+            'receiptBusiness' => $this->receiptBusinessSettings(),
+            'printSettings' => $appSettings,
             'barcodeValue' => $this->receiptBarcodeValue($ticket),
             'barcodeSvg' => $type === 'ingreso' ? $this->code39BarcodeSvg($this->receiptBarcodeValue($ticket)) : null,
             'formattedDuration' => $this->formatReceiptDuration((int) $summary['minutes']),
@@ -1233,6 +1295,7 @@ class ParkingController extends Controller
             'autoPrint' => false,
             'autoReturn' => false,
             'autoClose' => false,
+            'autoReturnSeconds' => (int) ($appSettings['auto_return_seconds'] ?? 3),
             'returnUrl' => route('entry'),
         ], $extra));
     }
@@ -1244,11 +1307,161 @@ class ParkingController extends Controller
             : route('entry');
     }
 
+    private function applicationSettings(): array
+    {
+        $defaults = [
+            'printer_name' => '',
+            'receipt_width_mm' => '80',
+            'receipt_copies' => '1',
+            'auto_return_seconds' => '3',
+            'backup_retention_days' => '30',
+            'business_name' => 'PARQUEADERO DONDE RICHARD',
+            'business_regime' => 'Regimen simplificado',
+            'business_nit' => 'NIT 7662483-1',
+            'business_address' => config('app.parking_address', env('PARKING_ADDRESS', 'Cra 71a #8 - 43 sur')),
+            'business_phone' => config('app.parking_phone', env('PARKING_PHONE', '3237902525')),
+        ];
+
+        try {
+            $stored = ApplicationSetting::query()->pluck('value', 'key')->all();
+        } catch (\Throwable) {
+            $stored = [];
+        }
+
+        return array_merge($defaults, array_filter($stored, fn($value) => $value !== null));
+    }
+
+    private function receiptBusinessSettings(): array
+    {
+        $settings = $this->applicationSettings();
+
+        return [
+            'name' => $settings['business_name'],
+            'regime' => $settings['business_regime'],
+            'nit' => $settings['business_nit'],
+            'address' => $settings['business_address'],
+            'phone' => $settings['business_phone'],
+        ];
+    }
+
+    private function configuredPrinterName(): string
+    {
+        return trim((string) ($this->applicationSettings()['printer_name'] ?? ''));
+    }
+
+    private function buildDatabaseBackupSql(): string
+    {
+        $connection = DB::connection();
+        $pdo = $connection->getPdo();
+        $driver = $connection->getDriverName();
+        $database = $connection->getDatabaseName();
+        $tables = $this->databaseTableNames($driver, $database);
+        $sql = [
+            '-- ParkManager database backup',
+            '-- Fecha: ' . now()->format('Y-m-d H:i:s'),
+            '-- Conexion: ' . $driver,
+            '',
+        ];
+
+        if ($driver === 'mysql') {
+            $sql[] = 'SET FOREIGN_KEY_CHECKS=0;';
+            $sql[] = '';
+        }
+
+        foreach ($tables as $table) {
+            $sql[] = '-- Tabla: ' . $table;
+            $sql[] = 'DROP TABLE IF EXISTS ' . $this->quoteIdentifier($table, $driver) . ';';
+            $sql[] = $this->createTableSql($driver, $table) . ';';
+            $sql[] = '';
+
+            $rows = $connection->table($table)->get();
+            foreach ($rows as $row) {
+                $values = get_object_vars($row);
+                if ($values === []) {
+                    continue;
+                }
+
+                $columns = implode(', ', array_map(fn(string $column) => $this->quoteIdentifier($column, $driver), array_keys($values)));
+                $serializedValues = implode(', ', array_map(fn($value) => $this->sqlValue($pdo, $value), array_values($values)));
+                $sql[] = 'INSERT INTO ' . $this->quoteIdentifier($table, $driver) . ' (' . $columns . ') VALUES (' . $serializedValues . ');';
+            }
+            $sql[] = '';
+        }
+
+        if ($driver === 'mysql') {
+            $sql[] = 'SET FOREIGN_KEY_CHECKS=1;';
+        }
+
+        return implode(PHP_EOL, $sql) . PHP_EOL;
+    }
+
+    private function databaseTableNames(string $driver, ?string $database): array
+    {
+        if ($driver === 'mysql') {
+            return collect(DB::select("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'"))
+                ->map(fn($row) => array_values((array) $row)[0] ?? null)
+                ->filter()
+                ->values()
+                ->all();
+        }
+
+        if ($driver === 'sqlite') {
+            return collect(DB::select("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"))
+                ->pluck('name')
+                ->all();
+        }
+
+        throw new \RuntimeException('Backup automatico no soportado para la conexion ' . ($database ?: $driver) . '.');
+    }
+
+    private function createTableSql(string $driver, string $table): string
+    {
+        if ($driver === 'mysql') {
+            $row = (array) DB::selectOne('SHOW CREATE TABLE ' . $this->quoteIdentifier($table, $driver));
+
+            return (string) ($row['Create Table'] ?? array_values($row)[1] ?? '');
+        }
+
+        if ($driver === 'sqlite') {
+            $row = DB::selectOne("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", [$table]);
+
+            return (string) ($row->sql ?? '');
+        }
+
+        throw new \RuntimeException('No se pudo obtener la estructura de la tabla ' . $table . '.');
+    }
+
+    private function quoteIdentifier(string $identifier, string $driver): string
+    {
+        if ($driver === 'sqlite') {
+            return '"' . str_replace('"', '""', $identifier) . '"';
+        }
+
+        return '`' . str_replace('`', '``', $identifier) . '`';
+    }
+
+    private function sqlValue(\PDO $pdo, mixed $value): string
+    {
+        if ($value === null) {
+            return 'NULL';
+        }
+
+        if (is_bool($value)) {
+            return $value ? '1' : '0';
+        }
+
+        if (is_int($value) || is_float($value)) {
+            return (string) $value;
+        }
+
+        return (string) $pdo->quote((string) $value);
+    }
+
     private function whatsappReceiptUrl(ParkingTicket $ticket, string $type): string
     {
         $ticket->loadMissing(['site', 'payment', 'tariffProfile']);
         $summary = $this->displaySummary($ticket);
-        $businessName = Str::upper('Parqueadero Donde Richard');
+        $businessName = Str::upper((string) $this->receiptBusinessSettings()['name']);
         $location = $this->formatReceiptLocation($ticket);
         $locker = $ticket->uses_locker
             ? 'SI - Locker ' . ($ticket->locker_number ?: 'N/A') . ' - ' . $this->money((int) ($summary['locker_fee'] ?? $ticket->locker_fee ?? 0))
@@ -2052,9 +2265,13 @@ class ParkingController extends Controller
         return implode(' ', $parts) . ' (' . $minutes . ' MIN)';
     }
 
-    private function sendReceiptToDefaultPrinter(ParkingTicket $ticket, string $type): bool
+    private function sendReceiptToDefaultPrinter(ParkingTicket $ticket, string $type, ?string $printerName = null): bool
     {
         if (PHP_OS_FAMILY !== 'Windows') {
+            return false;
+        }
+        $printerName = trim((string) $printerName);
+        if ($printerName === '') {
             return false;
         }
 
@@ -2068,12 +2285,8 @@ class ParkingController extends Controller
 
             $script = implode(PHP_EOL, [
             '$ErrorActionPreference = "Stop"',
-            '$printerName = ' . $this->powerShellString((string) env('PRINT_PRINTER_NAME', '')),
-            'if (-not $printerName) {',
-            '    $defaultPrinter = Get-CimInstance -ClassName Win32_Printer | Where-Object { $_.Default -eq $true } | Select-Object -First 1',
-            '    if ($defaultPrinter) { $printerName = $defaultPrinter.Name }',
-            '}',
-            'if (-not $printerName) { throw "No default printer configured. Set PRINT_PRINTER_NAME in .env." }',
+            '$printerName = ' . $this->powerShellString($printerName),
+            'if (-not $printerName) { throw "No printer configured." }',
             'if ($printerName -match "PDF|XPS|OneNote") { throw "Printer requires driver rendering, not RAW." }',
             '$rawPath = ' . $this->powerShellString($rawPath),
             '$bytes = [System.IO.File]::ReadAllBytes($rawPath)',
@@ -2128,11 +2341,11 @@ class ParkingController extends Controller
                 return true;
             }
 
-            if ($this->sendDriverReceiptToDefaultPrinter($ticket, $type, $summary)) {
+            if ($this->sendDriverReceiptToDefaultPrinter($ticket, $type, $summary, $printerName)) {
                 return true;
             }
 
-            return $this->sendPlainTextReceiptToDefaultPrinter($ticket, $type);
+            return $this->sendPlainTextReceiptToDefaultPrinter($ticket, $type, $printerName);
         } finally {
             $this->deleteTemporaryPrintFiles([$rawPath, $scriptPath]);
         }
@@ -2141,28 +2354,29 @@ class ParkingController extends Controller
     private function sendDriverReceiptToDefaultPrinter(
         ParkingTicket $ticket,
         string $type,
-        array $summary
+        array $summary,
+        string $printerName
     ): bool {
         $scriptPath = $this->temporaryPrintPath($ticket, $type, 'ps1');
         $barcodePatterns = json_encode($this->code39Patterns(), JSON_UNESCAPED_SLASHES);
+        $business = $this->receiptBusinessSettings();
+        $paperWidth = ((int) ($this->applicationSettings()['receipt_width_mm'] ?? 80)) === 58 ? 228 : 315;
+        $printableWidth = $paperWidth - 28;
         $script = implode(PHP_EOL, [
             '$ErrorActionPreference = "Stop"',
             'Add-Type -AssemblyName System.Drawing',
-            '$printerName = ' . $this->powerShellString((string) env('PRINT_PRINTER_NAME', '')),
-            'if (-not $printerName) {',
-            '    $defaultPrinter = Get-CimInstance -ClassName Win32_Printer | Where-Object { $_.Default -eq $true } | Select-Object -First 1',
-            '    if ($defaultPrinter) { $printerName = $defaultPrinter.Name }',
-            '}',
-            'if (-not $printerName) { throw "No default printer configured. Set PRINT_PRINTER_NAME in .env." }',
+            '$printerName = ' . $this->powerShellString($printerName),
+            'if (-not $printerName) { throw "No printer configured." }',
             'if ($printerName -match "PDF|XPS|OneNote") { throw "Virtual document printer detected." }',
             '$doc = New-Object System.Drawing.Printing.PrintDocument',
             '$doc.PrinterSettings.PrinterName = $printerName',
-            '$doc.DefaultPageSettings.PaperSize = New-Object System.Drawing.Printing.PaperSize("Receipt80", 315, 1100)',
+            '$doc.DefaultPageSettings.PaperSize = New-Object System.Drawing.Printing.PaperSize("Receipt", ' . $paperWidth . ', 1100)',
             '$doc.DefaultPageSettings.Margins = New-Object System.Drawing.Printing.Margins(0, 0, 0, 0)',
-            '$businessPhone = ' . $this->powerShellString((string) config('app.parking_phone', env('PARKING_PHONE', '3237902525'))),
-            '$businessAddress = ' . $this->powerShellString((string) config('app.parking_address', env('PARKING_ADDRESS', 'Cra 71a #8 - 43 sur'))),
-            '$businessRegime = "Regimen simplificado"',
-            '$businessNit = "NIT 7662483-1"',
+            '$businessName = ' . $this->powerShellString((string) $business['name']),
+            '$businessPhone = ' . $this->powerShellString((string) $business['phone']),
+            '$businessAddress = ' . $this->powerShellString((string) $business['address']),
+            '$businessRegime = ' . $this->powerShellString((string) $business['regime']),
+            '$businessNit = ' . $this->powerShellString((string) $business['nit']),
             '$receiptType = ' . $this->powerShellString($type),
             '$location = ' . $this->powerShellString($this->formatReceiptLocation($ticket)),
             '$locker = ' . $this->powerShellString($ticket->uses_locker ? 'SI - LOCKER ' . ($ticket->locker_number ?: 'N/A') : 'NO'),
@@ -2187,7 +2401,7 @@ class ParkingController extends Controller
             '    $fontBold = New-Object System.Drawing.Font("Arial", 10, [System.Drawing.FontStyle]::Bold)',
             '    $fontBig = New-Object System.Drawing.Font("Arial", 20, [System.Drawing.FontStyle]::Bold)',
             '    $fontTitle = New-Object System.Drawing.Font("Arial", 12, [System.Drawing.FontStyle]::Bold)',
-            '    $x = 14; $w = 287; $script:y = 12',
+            '    $x = 14; $w = ' . $printableWidth . '; $script:y = 12',
             '    function CenterText($text, $fontUse) {',
             '        $size = $g.MeasureString($text, $fontUse)',
             '        $g.DrawString($text, $fontUse, $black, [float](($w - $size.Width) / 2 + $x), [float]$script:y)',
@@ -2219,7 +2433,7 @@ class ParkingController extends Controller
             '        $script:y += $height + 3',
             '        CenterText $value $font',
             '    }',
-            '    CenterText "PARQUEADERO DONDE RICHARD" $fontTitle',
+            '    CenterText $businessName $fontTitle',
             '    CenterText $businessRegime $font',
             '    CenterText $businessNit $font',
             '    CenterText $businessAddress $font',
@@ -2266,7 +2480,7 @@ class ParkingController extends Controller
         }
     }
 
-    private function sendPlainTextReceiptToDefaultPrinter(ParkingTicket $ticket, string $type): bool
+    private function sendPlainTextReceiptToDefaultPrinter(ParkingTicket $ticket, string $type, string $printerName): bool
     {
         $ticket->loadMissing(['site', 'payment', 'tariffProfile']);
         $summary = $this->displaySummary($ticket);
@@ -2278,7 +2492,8 @@ class ParkingController extends Controller
 
             $script = implode(PHP_EOL, [
                 '$ErrorActionPreference = "SilentlyContinue"',
-                'Start-Process -FilePath "notepad.exe" -ArgumentList @("/p", ' . $this->powerShellString($textPath) . ') -WindowStyle Hidden -Wait',
+                '$printerName = ' . $this->powerShellString($printerName),
+                'Start-Process -FilePath ' . $this->powerShellString($textPath) . ' -Verb PrintTo -ArgumentList $printerName -WindowStyle Hidden -Wait',
             ]);
             file_put_contents($scriptPath, $script);
 
@@ -2317,12 +2532,13 @@ class ParkingController extends Controller
     {
         $line = str_repeat('-', 32);
         $locker = $ticket->uses_locker ? 'SI - LOCKER ' . ($ticket->locker_number ?: 'N/A') : 'NO';
+        $business = $this->receiptBusinessSettings();
         $rows = [
-            'PARQUEADERO DONDE RICHARD',
-            'Regimen simplificado',
-            'NIT 7662483-1',
-            config('app.parking_address', env('PARKING_ADDRESS', 'Cra 71a #8 - 43 sur')),
-            config('app.parking_phone', env('PARKING_PHONE', '3237902525')),
+            $business['name'],
+            $business['regime'],
+            $business['nit'],
+            $business['address'],
+            $business['phone'],
             $line,
             'PLACA: ' . $ticket->plate,
             'FECHA: ' . optional($ticket->entry_time)->format('d/m/Y'),
@@ -2555,18 +2771,20 @@ class ParkingController extends Controller
         $entryDate = optional($ticket->entry_time)->format('d/m/Y');
         $entryHour = optional($ticket->entry_time)->format('h:i A');
         $locker = $ticket->uses_locker ? 'SI - LOCKER ' . ($ticket->locker_number ?: 'N/A') : 'NO';
+        $business = $this->receiptBusinessSettings();
+        $barcodeWidth = ((int) ($this->applicationSettings()['receipt_width_mm'] ?? 80)) === 58 ? "\x02" : "\x03";
         $content = '';
 
         $content .= "\x1B@";              // Inicializar impresora.
         $content .= "\x1B\x74\x10";       // Tabla de caracteres compatible con acentos en muchas ESC/POS.
         $content .= "\x1B\x61\x01";       // Centrado.
         $content .= "\x1B\x21\x08";       // Enfatizado.
-        $content .= $this->thermalTextLine('PARQUEADERO DONDE RICHARD');
+        $content .= $this->thermalTextLine($business['name']);
         $content .= "\x1B\x21\x00";
-        $content .= $this->thermalTextLine('Regimen simplificado');
-        $content .= $this->thermalTextLine('NIT 7662483-1');
-        $content .= $this->thermalTextLine(config('app.parking_address', env('PARKING_ADDRESS', 'Cra 71a #8 - 43 sur')));
-        $content .= $this->thermalTextLine(config('app.parking_phone', env('PARKING_PHONE', '3237902525')));
+        $content .= $this->thermalTextLine($business['regime']);
+        $content .= $this->thermalTextLine($business['nit']);
+        $content .= $this->thermalTextLine($business['address']);
+        $content .= $this->thermalTextLine($business['phone']);
         $content .= $this->thermalTextLine($line);
 
         $content .= "\x1B\x61\x00";       // Alineado izquierda.
@@ -2601,7 +2819,7 @@ class ParkingController extends Controller
             $content .= "\x1B\x21\x00";
             $content .= "\x1D\x48\x02";   // HRI debajo del codigo.
             $content .= "\x1D\x68\x78";   // Altura grande del codigo de barras.
-            $content .= "\x1D\x77\x03";   // Ancho grande del codigo de barras.
+            $content .= "\x1D\x77" . $barcodeWidth;   // Ancho grande del codigo de barras.
             $content .= "\x1D\x6B\x04" . $this->sanitizeCode39($this->receiptBarcodeValue($ticket)) . "\x00";
             $content .= $this->thermalTextLine('');
             $content .= $this->thermalTextLine($line);
@@ -2621,11 +2839,11 @@ class ParkingController extends Controller
     private function thermalTextLine(?string $value): string
     {
         $value = (string) $value;
-        $value = strtr($value, [
-            'á' => 'a', 'é' => 'e', 'í' => 'i', 'ó' => 'o', 'ú' => 'u',
-            'Á' => 'A', 'É' => 'E', 'Í' => 'I', 'Ó' => 'O', 'Ú' => 'U',
-            'ñ' => 'n', 'Ñ' => 'N',
-        ]);
+        $ascii = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $value);
+        if (is_string($ascii) && $ascii !== '') {
+            $value = $ascii;
+        }
+        $value = preg_replace('/[^\x09\x0A\x0D\x20-\x7E]/', '', $value) ?? '';
 
         return $value . "\n";
     }
